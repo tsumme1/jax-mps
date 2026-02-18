@@ -193,56 +193,9 @@ PJRT_Error* MPS_LoadedExecutable_Execute(PJRT_LoadedExecutable_Execute_Args* arg
         return MakeError("No executable to execute");
     }
 
-    std::vector<jax_mps::MpsBuffer*> inputs;
-    for (size_t i = 0; i < args->num_args; i++) {
-        if (args->argument_lists[0][i]) {
-            inputs.push_back(args->argument_lists[0][i]->buffer.get());
-        }
-    }
-
-    // Debug: log expected vs actual outputs
-    size_t expected_outputs = args->executable->executable->executable->num_outputs();
-    MPS_LOG_DEBUG(" Execute: expected_outputs=%zu, num_args=%zu\n", expected_outputs,
-                  args->num_args);
-
-    PJRT_Client* client = args->executable->client;
-    jax_mps::MpsDevice* device =
-        client && !client->devices.empty() ? client->devices[0]->device : nullptr;
-
-    auto exec_result = args->executable->executable->executable->Execute(inputs, device);
-
-    // Check for execution errors
-    if (!exec_result.ok()) {
-        return MakeError("MPS execution failed: " + exec_result.error);
-    }
-
-    // Write outputs to the pre-allocated output_lists
-    size_t num_outputs = exec_result.buffers.size();
-    MPS_LOG_DEBUG(" Execute: actual_outputs=%zu, expected=%zu, client=%p\n", num_outputs,
-                  expected_outputs, (void*)client);
-
-    // Safety check: don't write more outputs than expected
-    if (num_outputs > expected_outputs) {
-        MPS_LOG_DEBUG(" WARNING: More outputs produced (%zu) than expected (%zu)!\n", num_outputs,
-                      expected_outputs);
-    }
-
-    for (size_t i = 0; i < num_outputs; i++) {
-        auto* buffer = new PJRT_Buffer();
-        buffer->buffer = std::move(exec_result.buffers[i]);
-        buffer->client = client;
-        args->output_lists[0][i] = buffer;
-        MPS_LOG_DEBUG(" Execute: output[%zu] buffer=%p, client->devices[0]=%p\n", i, (void*)buffer,
-                      (void*)(client->devices.empty() ? nullptr : client->devices[0]));
-    }
-
-    if (args->device_complete_events) {
-        auto* event = new PJRT_Event();
-        event->ready = true;
-        args->device_complete_events[0] = event;
-    }
-
-    return nullptr;
+    // TODO: Phase 1 - implement actual MLX execution
+    // For now, return an error indicating the stub is not implemented
+    return MakeError("MLX backend not implemented (Phase 0 stub)", PJRT_Error_Code_UNIMPLEMENTED);
 }
 
 PJRT_Error* MPS_Executable_DeserializeAndLoad(PJRT_Executable_DeserializeAndLoad_Args* args) {

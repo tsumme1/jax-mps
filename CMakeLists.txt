@@ -26,7 +26,6 @@ add_compile_options(-isysroot ${MACOS_SDK_PATH})
 # Find required Apple frameworks
 find_library(METAL_FRAMEWORK Metal REQUIRED)
 find_library(MPS_FRAMEWORK MetalPerformanceShaders REQUIRED)
-find_library(MPSGRAPH_FRAMEWORK MetalPerformanceShadersGraph REQUIRED)
 find_library(FOUNDATION_FRAMEWORK Foundation REQUIRED)
 
 # XLA PJRT headers (installed by setup_deps.sh)
@@ -116,23 +115,12 @@ set(PJRT_SOURCES
     src/pjrt_plugin/pjrt_executable.cc
     src/pjrt_plugin/pjrt_event.cc
     src/pjrt_plugin/pjrt_topology.cc
-    src/pjrt_plugin/mps_client.mm
-    src/pjrt_plugin/mps_device.mm
-    src/pjrt_plugin/mps_buffer.mm
-    src/pjrt_plugin/mps_executable.mm
     src/pjrt_plugin/stablehlo_parser.mm
     src/pjrt_plugin/type_utils.mm
-    src/pjrt_plugin/ops/binary_ops.mm
-    src/pjrt_plugin/ops/unary_ops.mm
-    src/pjrt_plugin/ops/shape_ops.mm
-    src/pjrt_plugin/ops/bitwise_ops.mm
-    src/pjrt_plugin/ops/fft_ops.mm
-    src/pjrt_plugin/ops/tensor_creation_ops.mm
-    src/pjrt_plugin/ops/convolution_ops.mm
-    src/pjrt_plugin/ops/reduction_ops.mm
-    src/pjrt_plugin/ops/control_flow_ops.mm
-    src/pjrt_plugin/ops/sort_ops.mm
-    src/pjrt_plugin/ops/linalg_ops.mm
+    src/pjrt_plugin/mlx_client.mm
+    src/pjrt_plugin/mlx_device.mm
+    src/pjrt_plugin/mlx_buffer.mm
+    src/pjrt_plugin/mlx_executable.mm
     ${PROTO_SRCS}
 )
 
@@ -241,7 +229,6 @@ endif()
 target_link_libraries(pjrt_plugin_mps PRIVATE
     ${METAL_FRAMEWORK}
     ${MPS_FRAMEWORK}
-    ${MPSGRAPH_FRAMEWORK}
     ${FOUNDATION_FRAMEWORK}
     ${STABLEHLO_LIBS}
     ${MLIR_LIBS}
