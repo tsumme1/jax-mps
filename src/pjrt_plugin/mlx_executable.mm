@@ -2,6 +2,8 @@
 
 #include "pjrt_plugin/mlx_executable.h"
 
+#include <mlx/compile.h>
+#include <mlx/einsum.h>
 #include <mlx/memory.h>
 #include <mlx/mlx.h>
 
@@ -1177,6 +1179,83 @@ bool IsIdentityPermutation(const std::vector<int>& perm) {
     return true;
 }
 
+// Check if einsum should be used for dot_general (MPS_USE_EINSUM=1)
+bool UseEinsumForDotGeneral() {
+    static bool use_einsum = std::getenv("MPS_USE_EINSUM") != nullptr;
+    return use_einsum;
+}
+
+// Build einsum subscript string for dot_general
+// Returns (lhs_subscript, rhs_subscript, output_subscript)
+std::string BuildEinsumSubscript(int lhsRank, int rhsRank, llvm::ArrayRef<int64_t> lhsBatchDims,
+                                 llvm::ArrayRef<int64_t> rhsBatchDims,
+                                 llvm::ArrayRef<int64_t> lhsContractDims,
+                                 llvm::ArrayRef<int64_t> rhsContractDims) {
+    // Use letters a-z for dimensions
+    char nextChar = 'a';
+
+    // Maps from dimension index to einsum character
+    std::vector<char> lhsChars(lhsRank, 0);
+    std::vector<char> rhsChars(rhsRank, 0);
+
+    // Assign shared characters for batch dims
+    for (size_t i = 0; i < lhsBatchDims.size(); ++i) {
+        char c = nextChar++;
+        lhsChars[lhsBatchDims[i]] = c;
+        rhsChars[rhsBatchDims[i]] = c;
+    }
+
+    // Assign shared characters for contracting dims
+    for (size_t i = 0; i < lhsContractDims.size(); ++i) {
+        char c = nextChar++;
+        lhsChars[lhsContractDims[i]] = c;
+        rhsChars[rhsContractDims[i]] = c;
+    }
+
+    // Assign unique characters for free dims
+    for (int i = 0; i < lhsRank; ++i) {
+        if (lhsChars[i] == 0) {
+            lhsChars[i] = nextChar++;
+        }
+    }
+    for (int i = 0; i < rhsRank; ++i) {
+        if (rhsChars[i] == 0) {
+            rhsChars[i] = nextChar++;
+        }
+    }
+
+    // Build subscript strings
+    std::string lhsSub(lhsChars.begin(), lhsChars.end());
+    std::string rhsSub(rhsChars.begin(), rhsChars.end());
+
+    // Build output: batch dims first, then lhs free dims, then rhs free dims
+    std::string outSub;
+    // Batch dims (from lhs, same as rhs)
+    for (int64_t d : lhsBatchDims) {
+        outSub += lhsChars[d];
+    }
+    // LHS free dims (in order of appearance in lhs)
+    for (int i = 0; i < lhsRank; ++i) {
+        bool isBatch = std::find(lhsBatchDims.begin(), lhsBatchDims.end(), i) != lhsBatchDims.end();
+        bool isContract =
+            std::find(lhsContractDims.begin(), lhsContractDims.end(), i) != lhsContractDims.end();
+        if (!isBatch && !isContract) {
+            outSub += lhsChars[i];
+        }
+    }
+    // RHS free dims (in order of appearance in rhs)
+    for (int i = 0; i < rhsRank; ++i) {
+        bool isBatch = std::find(rhsBatchDims.begin(), rhsBatchDims.end(), i) != rhsBatchDims.end();
+        bool isContract =
+            std::find(rhsContractDims.begin(), rhsContractDims.end(), i) != rhsContractDims.end();
+        if (!isBatch && !isContract) {
+            outSub += rhsChars[i];
+        }
+    }
+
+    return lhsSub + "," + rhsSub + "->" + outSub;
+}
+
 // Helper to detect reduction type by analyzing the body region
 enum class ReduceType { Sum, Max, Min, Prod, Unknown };
 
@@ -1282,6 +1361,18 @@ bool HandleDotGeneral(mlir::Operation* op, ValueMap& values, std::vector<mlx::co
 
     auto lhsRank = static_cast<int>(lhs.ndim());
     auto rhsRank = static_cast<int>(rhs.ndim());
+
+    // Try einsum path if enabled
+    if (UseEinsumForDotGeneral()) {
+        std::string subscript = BuildEinsumSubscript(lhsRank, rhsRank, lhsBatchDims, rhsBatchDims,
+                                                     lhsContractDims, rhsContractDims);
+        MPS_LOG_DEBUG("dot_general einsum: %s\n", subscript.c_str());
+        auto result = mlx::core::einsum(subscript, {lhs, rhs});
+        values.emplace(ToKey(op->getResult(0)), std::move(result));
+        return true;
+    }
+
+    // Standard path: transpose -> reshape -> matmul -> reshape
 
     // Build sets for quick lookup
     std::unordered_set<int> lhsContractSet(lhsContractDims.begin(), lhsContractDims.end());
