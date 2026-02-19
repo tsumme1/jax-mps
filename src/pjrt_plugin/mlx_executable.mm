@@ -1069,6 +1069,16 @@ bool HandlePower(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::a
     return true;
 }
 
+// Helper to check if a permutation is the identity (no transpose needed)
+bool IsIdentityPermutation(const std::vector<int>& perm) {
+    for (size_t i = 0; i < perm.size(); ++i) {
+        if (perm[i] != static_cast<int>(i)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // Helper to detect reduction type by analyzing the body region
 enum class ReduceType { Sum, Max, Min, Prod, Unknown };
 
@@ -1348,25 +1358,10 @@ bool HandleConvolution(mlir::Operation* op, ValueMap& values,
     }
     kernelPerm[1 + numSpatialDims] = static_cast<int>(kernelInputFeatureDim);
 
-    // Check if transposition is needed
-    bool inputNeedsTranspose = false;
-    for (int i = 0; i < static_cast<int>(inputPerm.size()); ++i) {
-        if (inputPerm[i] != i) {
-            inputNeedsTranspose = true;
-            break;
-        }
-    }
-
-    bool kernelNeedsTranspose = false;
-    for (int i = 0; i < static_cast<int>(kernelPerm.size()); ++i) {
-        if (kernelPerm[i] != i) {
-            kernelNeedsTranspose = true;
-            break;
-        }
-    }
-
-    auto inputT = inputNeedsTranspose ? mlx::core::transpose(input, inputPerm) : input;
-    auto kernelT = kernelNeedsTranspose ? mlx::core::transpose(kernel, kernelPerm) : kernel;
+    // Transpose input and kernel if needed
+    auto inputT = IsIdentityPermutation(inputPerm) ? input : mlx::core::transpose(input, inputPerm);
+    auto kernelT =
+        IsIdentityPermutation(kernelPerm) ? kernel : mlx::core::transpose(kernel, kernelPerm);
 
     // Extract strides
     std::vector<int> strides;
@@ -1412,34 +1407,29 @@ bool HandleConvolution(mlir::Operation* op, ValueMap& values,
     // Handle feature_group_count for grouped/depthwise convolutions
     auto featureGroupCount = static_cast<int>(convOp.getFeatureGroupCount());
 
+    // batch_group_count is used for specialized grouped convolutions; not currently supported
+    auto batchGroupCount = convOp.getBatchGroupCount();
+    if (batchGroupCount != 1) {
+        MPS_LOG_ERROR("stablehlo.convolution: batch_group_count != 1 not supported\n");
+        return false;
+    }
+
     // Call MLX conv_general
-    // MLX signature: conv_general(input, weight, stride, padding_lo, padding_hi, kernel_dilation,
-    //                             input_dilation, groups, flip)
     auto convResult =
         mlx::core::conv_general(inputT, kernelT, strides, paddingLow, paddingHigh, kernelDilation,
                                 inputDilation, featureGroupCount, false);
 
-    // Check if output needs transposition
-    // MLX outputs in [N, spatial..., C_out] format, but StableHLO might expect different layout
-    // MLX positions: 0=batch, 1..numSpatialDims=spatial, numSpatialDims+1=feature
-    // We need to map MLX positions to StableHLO positions
+    // Build output permutation to convert from MLX format [N, spatial..., C_out] to StableHLO
+    // format. outputPerm[i] = j means: position i in output gets data from MLX position j
     std::vector<int> outputPerm(convResult.ndim());
-    outputPerm[outputBatchDim] = 0;  // batch from MLX position 0
+    outputPerm[outputBatchDim] = 0;
     for (int i = 0; i < numSpatialDims; ++i) {
-        outputPerm[outputSpatialDims[i]] = 1 + i;  // spatial[i] from MLX position 1+i
+        outputPerm[outputSpatialDims[i]] = 1 + i;
     }
-    outputPerm[outputFeatureDim] =
-        1 + numSpatialDims;  // feature from MLX position numSpatialDims+1
+    outputPerm[outputFeatureDim] = 1 + numSpatialDims;
 
-    bool outputNeedsTranspose = false;
-    for (int i = 0; i < static_cast<int>(outputPerm.size()); ++i) {
-        if (outputPerm[i] != i) {
-            outputNeedsTranspose = true;
-            break;
-        }
-    }
-
-    auto result = outputNeedsTranspose ? mlx::core::transpose(convResult, outputPerm) : convResult;
+    auto result = IsIdentityPermutation(outputPerm) ? convResult
+                                                    : mlx::core::transpose(convResult, outputPerm);
     values.emplace(ToKey(op->getResult(0)), std::move(result));
     return true;
 }
