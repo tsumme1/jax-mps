@@ -2,8 +2,11 @@
 
 #include "pjrt_plugin/mlx_executable.h"
 
+#include <mlx/memory.h>
 #include <mlx/mlx.h>
 
+#include <chrono>
+#include <cstdlib>
 #include <functional>
 #include <stdexcept>
 #include <unordered_map>
@@ -22,6 +25,101 @@
 namespace jax_mps {
 
 namespace {
+
+// Profiling infrastructure
+using Clock = std::chrono::high_resolution_clock;
+using Duration = std::chrono::duration<double, std::milli>;
+
+// Check if profiling is enabled (cached on first call)
+bool IsProfilingEnabled() {
+    static bool enabled = std::getenv("MPS_PROFILE") != nullptr;
+    return enabled;
+}
+
+// Per-op timing accumulator
+struct OpTimingStats {
+    double total_ms = 0.0;
+    size_t count = 0;
+};
+
+// Global profiling state (only used when MPS_PROFILE=1)
+struct ProfilingState {
+    std::unordered_map<std::string, OpTimingStats> op_times;
+    double dispatch_overhead_ms = 0.0;
+    double eval_time_ms = 0.0;
+    double total_execution_ms = 0.0;
+    size_t execution_count = 0;
+
+    // Cumulative stats across all executions
+    double cumulative_dispatch_ms = 0.0;
+    double cumulative_eval_ms = 0.0;
+    double cumulative_total_ms = 0.0;
+
+    // Track time between Execute() calls
+    Clock::time_point last_execute_end;
+    double cumulative_between_calls_ms = 0.0;
+    bool has_last_time = false;
+
+    void Reset() {
+        op_times.clear();
+        dispatch_overhead_ms = 0.0;
+        eval_time_ms = 0.0;
+        total_execution_ms = 0.0;
+    }
+
+    void RecordOp(const std::string& name, double ms) {
+        auto& stats = op_times[name];
+        stats.total_ms += ms;
+        stats.count++;
+    }
+
+    void PrintSummary() {
+        execution_count++;
+
+        // Accumulate stats
+        cumulative_dispatch_ms += dispatch_overhead_ms;
+        cumulative_eval_ms += eval_time_ms;
+        cumulative_total_ms += total_execution_ms;
+
+        // Only print final summary (every 1000 executions)
+        if (execution_count % 1000 != 0) {
+            return;
+        }
+
+        fprintf(stderr, "\n=== MPS Final Summary (%zu executions) ===\n", execution_count);
+        fprintf(stderr, "Total GPU time: %.0f ms (dispatch: %.0f ms, eval: %.0f ms)\n",
+                cumulative_total_ms, cumulative_dispatch_ms, cumulative_eval_ms);
+
+        // Sort ops by total time
+        std::vector<std::pair<std::string, OpTimingStats>> sorted_ops(op_times.begin(),
+                                                                      op_times.end());
+        std::sort(sorted_ops.begin(), sorted_ops.end(), [](const auto& a, const auto& b) {
+            return a.second.total_ms > b.second.total_ms;
+        });
+
+        fprintf(stderr, "\nTop ops by dispatch time:\n");
+        int shown = 0;
+        for (const auto& [name, stats] : sorted_ops) {
+            if (shown++ >= 5)
+                break;
+            fprintf(stderr, "  %-25s: %.1f ms (%zu calls)\n", name.c_str(), stats.total_ms,
+                    stats.count);
+        }
+
+        // Memory stats
+        size_t peak_mem = mlx::core::get_peak_memory();
+        fprintf(stderr, "Peak memory: %.0f MB\n", static_cast<double>(peak_mem) / 1e6);
+        fprintf(stderr, "=========================================\n");
+
+        // Reset op times for next batch
+        Reset();
+    }
+};
+
+ProfilingState& GetProfilingState() {
+    static ProfilingState state;
+    return state;
+}
 
 // Convert MLIR type to MLX dtype
 mlx::core::Dtype MlirTypeToMlxDtype(mlir::Type type) {
@@ -1616,6 +1714,13 @@ bool DispatchOp(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::ar
     }
 
     try {
+        if (IsProfilingEnabled()) {
+            auto start = Clock::now();
+            bool result = it->second(op, values, outputs, ctx);
+            auto end = Clock::now();
+            GetProfilingState().RecordOp(opName, Duration(end - start).count());
+            return result;
+        }
         return it->second(op, values, outputs, ctx);
     } catch (const std::exception& e) {
         MPS_LOG_ERROR("Exception dispatching %s: %s\n", opName.c_str(), e.what());
@@ -1762,6 +1867,23 @@ size_t MlxExecutable::num_outputs() const {
 
 MlxExecuteResult MlxExecutable::Execute(const std::vector<MlxBuffer*>& inputs) {
     MlxExecuteResult result;
+    const bool profiling = IsProfilingEnabled();
+    Clock::time_point exec_start;
+    Clock::time_point dispatch_start;
+    Clock::time_point dispatch_end;
+    Clock::time_point eval_start;
+    Clock::time_point eval_end;
+    Clock::time_point exec_end;
+
+    if (profiling) {
+        exec_start = Clock::now();
+        // Track time since last Execute() call
+        auto& state = GetProfilingState();
+        if (state.has_last_time) {
+            state.cumulative_between_calls_ms +=
+                Duration(exec_start - state.last_execute_end).count();
+        }
+    }
 
     if (!valid_) {
         MPS_LOG_ERROR("Cannot execute invalid executable: %s\n", error_.c_str());
@@ -1793,11 +1915,20 @@ MlxExecuteResult MlxExecutable::Execute(const std::vector<MlxBuffer*>& inputs) {
     ExecContext ctx;
     ctx.module = *parsed_module_.module;
 
-    // Execute the entry function
+    // Execute the entry function (graph construction + op dispatch)
+    if (profiling) {
+        dispatch_start = Clock::now();
+    }
     std::vector<mlx::core::array> outputs;
+
+    // Always use dynamic dispatch (compiled path was slower due to std::function overhead)
     if (!ExecuteFunction(parsed_module_.entry_func, inputArrays, outputs, ctx)) {
         MPS_LOG_ERROR("Failed to execute entry function\n");
         return result;
+    }
+
+    if (profiling) {
+        dispatch_end = Clock::now();
     }
 
     // Validate output count
@@ -1808,6 +1939,9 @@ MlxExecuteResult MlxExecutable::Execute(const std::vector<MlxBuffer*>& inputs) {
     }
 
     // Evaluate all outputs with error handling
+    if (profiling) {
+        eval_start = Clock::now();
+    }
     if (!outputs.empty()) {
         try {
             mlx::core::eval(outputs);
@@ -1816,10 +1950,36 @@ MlxExecuteResult MlxExecutable::Execute(const std::vector<MlxBuffer*>& inputs) {
             return result;
         }
     }
+    if (profiling) {
+        eval_end = Clock::now();
+    }
 
     // Wrap outputs in MlxBuffer
     for (auto& arr : outputs) {
         result.buffers.push_back(MlxBuffer::FromArray(std::move(arr)));
+    }
+
+    // Record profiling stats
+    if (profiling) {
+        exec_end = Clock::now();
+        auto& state = GetProfilingState();
+        state.dispatch_overhead_ms = Duration(dispatch_end - dispatch_start).count();
+        state.eval_time_ms = Duration(eval_end - eval_start).count();
+        state.total_execution_ms = Duration(exec_end - exec_start).count();
+        state.last_execute_end = exec_end;
+        state.has_last_time = true;
+
+        // Track slow executions (likely forward/backward passes)
+        static size_t slow_count = 0;
+        static double slow_total_ms = 0;
+        if (state.total_execution_ms > 100.0) {
+            slow_count++;
+            slow_total_ms += state.total_execution_ms;
+            fprintf(stderr, "[COMPUTE #%zu] %.0f ms (eval: %.0f ms)\n", slow_count,
+                    state.total_execution_ms, state.eval_time_ms);
+        }
+
+        state.PrintSummary();
     }
 
     MPS_LOG_DEBUG("Execution complete with %zu outputs\n", result.buffers.size());
