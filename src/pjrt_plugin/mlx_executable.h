@@ -1,6 +1,9 @@
 #pragma once
 
+#include <mlx/mlx.h>
+
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_set>
@@ -51,6 +54,12 @@ private:
     bool valid_ = false;
     size_t num_outputs_ = 0;
     std::vector<OutputInfo> output_info_;
+
+    // MLX compile support
+    mutable bool compile_attempted_ = false;
+    mutable bool compile_succeeded_ = false;
+    mutable std::function<std::vector<mlx::core::array>(const std::vector<mlx::core::array>&)>
+        compiled_fn_;
 };
 
 }  // namespace jax_mps

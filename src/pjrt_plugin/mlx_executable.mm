@@ -752,6 +752,7 @@ bool HandleSlice(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::a
         return false;
     }
 
+    auto& input = input_opt->get();
     auto startIndices = sliceOp.getStartIndices();
     auto limitIndices = sliceOp.getLimitIndices();
     auto strides = sliceOp.getStrides();
@@ -765,8 +766,7 @@ bool HandleSlice(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::a
         steps.push_back(static_cast<int>(strides[i]));
     }
 
-    values.emplace(ToKey(op->getResult(0)),
-                   mlx::core::slice(input_opt->get(), starts, stops, steps));
+    values.emplace(ToKey(op->getResult(0)), mlx::core::slice(input, starts, stops, steps));
     return true;
 }
 
@@ -788,45 +788,68 @@ bool HandleDynamicSlice(mlir::Operation* op, ValueMap& values,
     auto& input = input_opt->get();
     auto sliceSizes = dynamicSliceOp.getSliceSizes();
 
-    // Get start indices from remaining operands (they are scalar tensors)
-    mlx::core::Shape starts;
-    mlx::core::Shape stops;
+    // Try fast path first: extract concrete indices and use mlx::core::slice
+    // This will fail during MLX compile() tracing, in which case we fall back to lazy path
+    try {
+        mlx::core::Shape starts;
+        mlx::core::Shape stops;
+        for (size_t i = 1; i < op->getNumOperands(); ++i) {
+            auto idx_opt = GetValue(values, op->getOperand(i));
+            if (!idx_opt) {
+                MPS_LOG_ERROR("stablehlo.dynamic_slice: start index operand not found\n");
+                return false;
+            }
+            auto& idx_arr = idx_opt->get();
+            mlx::core::eval(idx_arr);
+
+            int start;
+            switch (idx_arr.dtype()) {
+                case mlx::core::int32:
+                    start = idx_arr.item<int32_t>();
+                    break;
+                case mlx::core::int64:
+                    start = static_cast<int>(idx_arr.item<int64_t>());
+                    break;
+                case mlx::core::uint32:
+                    start = static_cast<int>(idx_arr.item<uint32_t>());
+                    break;
+                case mlx::core::uint64:
+                    start = static_cast<int>(idx_arr.item<uint64_t>());
+                    break;
+                default:
+                    start = idx_arr.item<int>();
+                    break;
+            }
+
+            int size = static_cast<int>(sliceSizes[i - 1]);
+            starts.push_back(start);
+            stops.push_back(start + size);
+        }
+        values.emplace(ToKey(op->getResult(0)), mlx::core::slice(input, starts, stops));
+        return true;
+    } catch (const std::exception&) {  // NOLINT(bugprone-empty-catch)
+        // Intentionally empty - fall through to lazy path below.
+        // This happens during MLX compile() tracing when eval() fails.
+    }
+
+    // Lazy path: use take() with computed indices for MLX compile() compatibility
+    auto result = input;
     for (size_t i = 1; i < op->getNumOperands(); ++i) {
         auto idx_opt = GetValue(values, op->getOperand(i));
         if (!idx_opt) {
             MPS_LOG_ERROR("stablehlo.dynamic_slice: start index operand not found\n");
             return false;
         }
-        // Eval and extract scalar value - handle different integer types
-        auto& idx_arr = idx_opt->get();
-        mlx::core::eval(idx_arr);
-
-        int start;
-        switch (idx_arr.dtype()) {
-            case mlx::core::int32:
-                start = idx_arr.item<int32_t>();
-                break;
-            case mlx::core::int64:
-                start = static_cast<int>(idx_arr.item<int64_t>());
-                break;
-            case mlx::core::uint32:
-                start = static_cast<int>(idx_arr.item<uint32_t>());
-                break;
-            case mlx::core::uint64:
-                start = static_cast<int>(idx_arr.item<uint64_t>());
-                break;
-            default:
-                // Fall back to int32, may throw if incompatible
-                start = idx_arr.item<int>();
-                break;
-        }
-
+        auto& start_idx = idx_opt->get();
         int size = static_cast<int>(sliceSizes[i - 1]);
-        starts.push_back(start);
-        stops.push_back(start + size);
-    }
+        int axis = static_cast<int>(i - 1);
 
-    values.emplace(ToKey(op->getResult(0)), mlx::core::slice(input, starts, stops));
+        // Create indices: start + [0, 1, 2, ..., size-1]
+        auto offsets = mlx::core::arange(0, size, mlx::core::int32);
+        auto indices = mlx::core::add(mlx::core::astype(start_idx, mlx::core::int32), offsets);
+        result = mlx::core::take(result, indices, axis);
+    }
+    values.emplace(ToKey(op->getResult(0)), std::move(result));
     return true;
 }
 
@@ -1548,6 +1571,7 @@ bool HandleConvolution(mlir::Operation* op, ValueMap& values,
     kernelPerm[1 + numSpatialDims] = static_cast<int>(kernelInputFeatureDim);
 
     // Transpose input and kernel if needed
+    // Note: JAX uses HWIO kernel layout, MLX expects OHWI, so kernel transpose is typically needed
     auto inputT = IsIdentityPermutation(inputPerm) ? input : mlx::core::transpose(input, inputPerm);
     auto kernelT =
         IsIdentityPermutation(kernelPerm) ? kernel : mlx::core::transpose(kernel, kernelPerm);
@@ -2012,10 +2036,51 @@ MlxExecuteResult MlxExecutable::Execute(const std::vector<MlxBuffer*>& inputs) {
     }
     std::vector<mlx::core::array> outputs;
 
-    // Always use dynamic dispatch (compiled path was slower due to std::function overhead)
-    if (!ExecuteFunction(parsed_module_.entry_func, inputArrays, outputs, ctx)) {
-        MPS_LOG_ERROR("Failed to execute entry function\n");
-        return result;
+    // Try MLX compile() on first execution - it can fuse kernels for better performance
+    // Can be disabled with MPS_NO_COMPILE=1 for debugging
+    static bool disable_compile = std::getenv("MPS_NO_COMPILE") != nullptr;
+    if (!compile_attempted_ && !disable_compile) {
+        compile_attempted_ = true;
+
+        // Create a function that we can compile
+        // Note: capture 'this' only - ctx would be invalid on subsequent calls
+        auto exec_fn =
+            [this](const std::vector<mlx::core::array>& inputs) -> std::vector<mlx::core::array> {
+            std::vector<mlx::core::array> outs;
+            ExecContext local_ctx;
+            local_ctx.module = *parsed_module_.module;
+            if (!ExecuteFunction(parsed_module_.entry_func, inputs, outs, local_ctx)) {
+                return {};
+            }
+            return outs;
+        };
+
+        try {
+            // Try to compile the function
+            compiled_fn_ = mlx::core::compile(exec_fn);
+
+            // Test that compile works by running it once
+            auto test_outputs = compiled_fn_(inputArrays);
+            if (!test_outputs.empty()) {
+                mlx::core::eval(test_outputs);
+                compile_succeeded_ = true;
+                outputs = std::move(test_outputs);
+                MPS_LOG_INFO("MLX compile() succeeded - using compiled execution path\n");
+            }
+        } catch (const std::exception& e) {
+            MPS_LOG_INFO("MLX compile() failed (%s), using direct path\n", e.what());
+            compile_succeeded_ = false;
+        }
+    }
+
+    // Use compiled function if available, otherwise fall back to direct execution
+    if (compile_succeeded_ && outputs.empty()) {
+        outputs = compiled_fn_(inputArrays);
+    } else if (outputs.empty()) {
+        if (!ExecuteFunction(parsed_module_.entry_func, inputArrays, outputs, ctx)) {
+            MPS_LOG_ERROR("Failed to execute entry function\n");
+            return result;
+        }
     }
 
     if (profiling) {
