@@ -5,6 +5,7 @@
 
 #import <Foundation/Foundation.h>
 
+#include <cstdlib>
 #include <unordered_set>
 
 #include "llvm/Support/MemoryBuffer.h"

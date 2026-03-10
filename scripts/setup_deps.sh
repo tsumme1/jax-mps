@@ -231,11 +231,17 @@ install_stablehlo_headers() {
     cp "$STABLEHLO_DIR/stablehlo/api/"*.h "$PREFIX/include/stablehlo/api/"
     cp "$STABLEHLO_DIR/stablehlo/transforms/"*.h "$PREFIX/include/stablehlo/transforms/"
     cp "$STABLEHLO_DIR/stablehlo/transforms/optimization/"*.h "$PREFIX/include/stablehlo/transforms/optimization/"
-    # Copy generated tablegen headers (only available after a build)
+    # Copy generated tablegen headers (only available after a build).
+    # In cached-install scenarios the build directory may have been cleaned
+    # while the prefix still has headers. Warn if .inc files are missing.
     if [ -d "$STABLEHLO_BUILD_DIR" ]; then
         cp "$STABLEHLO_BUILD_DIR/stablehlo/dialect/"*.inc "$PREFIX/include/stablehlo/dialect/" 2>/dev/null || true
         cp "$STABLEHLO_BUILD_DIR/stablehlo/transforms/"*.inc "$PREFIX/include/stablehlo/transforms/" 2>/dev/null || true
         cp "$STABLEHLO_BUILD_DIR/stablehlo/transforms/optimization/"*.inc "$PREFIX/include/stablehlo/transforms/optimization/" 2>/dev/null || true
+    elif ! compgen -G "$PREFIX/include/stablehlo/dialect/"'*.inc' > /dev/null 2>&1; then
+        echo "WARNING: StableHLO generated headers (*.inc) not found and build"
+        echo "  directory is unavailable. Re-run setup_deps.sh with --force to"
+        echo "  rebuild StableHLO and regenerate the missing headers."
     fi
 }
 
