@@ -441,6 +441,363 @@ bool HandleClamp(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::a
     return true;
 }
 
+// Handler for stablehlo.tanh
+bool HandleTanh(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::array>& outputs,
+                ExecContext& ctx) {
+    auto input_opt = GetValue(values, op->getOperand(0));
+    if (!input_opt) {
+        MPS_LOG_ERROR("stablehlo.tanh: operand not found in value map\n");
+        return false;
+    }
+    values.emplace(ToKey(op->getResult(0)), mlx::core::tanh(input_opt->get()));
+    return true;
+}
+
+// Handler for stablehlo.tan (MLX doesn't have a direct tan, use sin/cos)
+bool HandleTan(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::array>& outputs,
+               ExecContext& ctx) {
+    auto input_opt = GetValue(values, op->getOperand(0));
+    if (!input_opt) {
+        MPS_LOG_ERROR("stablehlo.tan: operand not found in value map\n");
+        return false;
+    }
+    auto& x = input_opt->get();
+    values.emplace(ToKey(op->getResult(0)),
+                   mlx::core::divide(mlx::core::sin(x), mlx::core::cos(x)));
+    return true;
+}
+
+// Handler for stablehlo.sign
+bool HandleSign(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::array>& outputs,
+                ExecContext& ctx) {
+    auto input_opt = GetValue(values, op->getOperand(0));
+    if (!input_opt) {
+        MPS_LOG_ERROR("stablehlo.sign: operand not found in value map\n");
+        return false;
+    }
+    values.emplace(ToKey(op->getResult(0)), mlx::core::sign(input_opt->get()));
+    return true;
+}
+
+// Handler for stablehlo.remainder
+bool HandleRemainder(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::array>& outputs,
+                     ExecContext& ctx) {
+    auto lhs_opt = GetValue(values, op->getOperand(0));
+    auto rhs_opt = GetValue(values, op->getOperand(1));
+    if (!lhs_opt || !rhs_opt) {
+        MPS_LOG_ERROR("stablehlo.remainder: operand not found in value map\n");
+        return false;
+    }
+    values.emplace(ToKey(op->getResult(0)), mlx::core::remainder(lhs_opt->get(), rhs_opt->get()));
+    return true;
+}
+
+// Handler for stablehlo.ceil
+bool HandleCeil(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::array>& outputs,
+                ExecContext& ctx) {
+    auto input_opt = GetValue(values, op->getOperand(0));
+    if (!input_opt) {
+        MPS_LOG_ERROR("stablehlo.ceil: operand not found in value map\n");
+        return false;
+    }
+    values.emplace(ToKey(op->getResult(0)), mlx::core::ceil(input_opt->get()));
+    return true;
+}
+
+// Handler for stablehlo.round_nearest_even
+bool HandleRoundNearestEven(mlir::Operation* op, ValueMap& values,
+                            std::vector<mlx::core::array>& outputs, ExecContext& ctx) {
+    auto input_opt = GetValue(values, op->getOperand(0));
+    if (!input_opt) {
+        MPS_LOG_ERROR("stablehlo.round_nearest_even: operand not found in value map\n");
+        return false;
+    }
+    values.emplace(ToKey(op->getResult(0)), mlx::core::round(input_opt->get()));
+    return true;
+}
+
+// Handler for stablehlo.is_finite
+bool HandleIsFinite(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::array>& outputs,
+                    ExecContext& ctx) {
+    auto input_opt = GetValue(values, op->getOperand(0));
+    if (!input_opt) {
+        MPS_LOG_ERROR("stablehlo.is_finite: operand not found in value map\n");
+        return false;
+    }
+    values.emplace(ToKey(op->getResult(0)), mlx::core::isfinite(input_opt->get()));
+    return true;
+}
+
+// Handler for stablehlo.exponential_minus_one
+bool HandleExpm1(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::array>& outputs,
+                 ExecContext& ctx) {
+    auto input_opt = GetValue(values, op->getOperand(0));
+    if (!input_opt) {
+        MPS_LOG_ERROR("stablehlo.exponential_minus_one: operand not found in value map\n");
+        return false;
+    }
+    values.emplace(ToKey(op->getResult(0)), mlx::core::expm1(input_opt->get()));
+    return true;
+}
+
+// Handler for stablehlo.cbrt (cube root = sign(x) * |x|^(1/3))
+bool HandleCbrt(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::array>& outputs,
+                ExecContext& ctx) {
+    auto input_opt = GetValue(values, op->getOperand(0));
+    if (!input_opt) {
+        MPS_LOG_ERROR("stablehlo.cbrt: operand not found in value map\n");
+        return false;
+    }
+    auto& x = input_opt->get();
+    // cbrt(x) = sign(x) * |x|^(1/3)
+    auto third = mlx::core::array(1.0F / 3.0F, x.dtype());
+    auto result =
+        mlx::core::multiply(mlx::core::sign(x), mlx::core::power(mlx::core::abs(x), third));
+    values.emplace(ToKey(op->getResult(0)), std::move(result));
+    return true;
+}
+
+// Handler for stablehlo.atan2 (maps to atan2 in MLX via arctan2)
+bool HandleAtan2(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::array>& outputs,
+                 ExecContext& ctx) {
+    auto lhs_opt = GetValue(values, op->getOperand(0));
+    auto rhs_opt = GetValue(values, op->getOperand(1));
+    if (!lhs_opt || !rhs_opt) {
+        MPS_LOG_ERROR("stablehlo.atan2: operand not found in value map\n");
+        return false;
+    }
+    values.emplace(ToKey(op->getResult(0)), mlx::core::arctan2(lhs_opt->get(), rhs_opt->get()));
+    return true;
+}
+
+// Handler for stablehlo.not (bitwise not)
+bool HandleNot(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::array>& outputs,
+               ExecContext& ctx) {
+    auto input_opt = GetValue(values, op->getOperand(0));
+    if (!input_opt) {
+        MPS_LOG_ERROR("stablehlo.not: operand not found in value map\n");
+        return false;
+    }
+    auto& x = input_opt->get();
+    if (x.dtype() == mlx::core::bool_) {
+        values.emplace(ToKey(op->getResult(0)), mlx::core::logical_not(x));
+    } else {
+        // Bitwise NOT for integers: ~x = x XOR all-ones
+        auto all_ones = mlx::core::full(x.shape(), -1, x.dtype());
+        values.emplace(ToKey(op->getResult(0)), mlx::core::bitwise_xor(x, all_ones));
+    }
+    return true;
+}
+
+// Handler for stablehlo.shift_right_arithmetic
+bool HandleShiftRightArithmetic(mlir::Operation* op, ValueMap& values,
+                                std::vector<mlx::core::array>& outputs, ExecContext& ctx) {
+    auto lhs_opt = GetValue(values, op->getOperand(0));
+    auto rhs_opt = GetValue(values, op->getOperand(1));
+    if (!lhs_opt || !rhs_opt) {
+        MPS_LOG_ERROR("stablehlo.shift_right_arithmetic: operand not found in value map\n");
+        return false;
+    }
+    // MLX right_shift is arithmetic for signed types
+    values.emplace(ToKey(op->getResult(0)), mlx::core::right_shift(lhs_opt->get(), rhs_opt->get()));
+    return true;
+}
+
+// Handler for stablehlo.popcnt (population count)
+bool HandlePopcount(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::array>& outputs,
+                    ExecContext& ctx) {
+    auto input_opt = GetValue(values, op->getOperand(0));
+    if (!input_opt) {
+        MPS_LOG_ERROR("stablehlo.popcnt: operand not found in value map\n");
+        return false;
+    }
+    auto& x = input_opt->get();
+    // Implement popcount using bit manipulation for integer types
+    // Use the parallel bit count algorithm
+    auto dtype = x.dtype();
+    auto val = mlx::core::astype(x, mlx::core::uint32);
+    // Standard Hamming weight algorithm
+    auto m1 = mlx::core::array(0x55555555U, mlx::core::uint32);
+    auto m2 = mlx::core::array(0x33333333U, mlx::core::uint32);
+    auto m4 = mlx::core::array(0x0F0F0F0FU, mlx::core::uint32);
+    val = mlx::core::subtract(
+        val, mlx::core::bitwise_and(
+                 mlx::core::right_shift(val, mlx::core::array(1, mlx::core::uint32)), m1));
+    val = mlx::core::add(
+        mlx::core::bitwise_and(val, m2),
+        mlx::core::bitwise_and(mlx::core::right_shift(val, mlx::core::array(2, mlx::core::uint32)),
+                               m2));
+    val = mlx::core::bitwise_and(
+        mlx::core::add(val, mlx::core::right_shift(val, mlx::core::array(4, mlx::core::uint32))),
+        m4);
+    val = mlx::core::add(val, mlx::core::right_shift(val, mlx::core::array(8, mlx::core::uint32)));
+    val = mlx::core::add(val, mlx::core::right_shift(val, mlx::core::array(16, mlx::core::uint32)));
+    val = mlx::core::bitwise_and(val, mlx::core::array(0x3FU, mlx::core::uint32));
+    values.emplace(ToKey(op->getResult(0)), mlx::core::astype(val, dtype));
+    return true;
+}
+
+// Handler for stablehlo.pad
+bool HandlePad(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::array>& outputs,
+               ExecContext& ctx) {
+    auto padOp = mlir::dyn_cast<mlir::stablehlo::PadOp>(op);
+    if (!padOp) {
+        MPS_LOG_ERROR("stablehlo.pad: failed to cast\n");
+        return false;
+    }
+
+    auto input_opt = GetValue(values, padOp.getOperand());
+    auto padValue_opt = GetValue(values, padOp.getPaddingValue());
+    if (!input_opt || !padValue_opt) {
+        MPS_LOG_ERROR("stablehlo.pad: operand not found in value map\n");
+        return false;
+    }
+
+    auto& input = input_opt->get();
+    auto& padValue = padValue_opt->get();
+    auto edgePaddingLow = padOp.getEdgePaddingLow();
+    auto edgePaddingHigh = padOp.getEdgePaddingHigh();
+    auto interiorPadding = padOp.getInteriorPadding();
+
+    // Check for interior padding (not yet supported)
+    bool hasInterior = false;
+    for (int64_t p : interiorPadding) {
+        if (p != 0) {
+            hasInterior = true;
+            break;
+        }
+    }
+
+    if (hasInterior) {
+        MPS_LOG_ERROR("stablehlo.pad: interior padding not yet supported\n");
+        return false;
+    }
+
+    // Edge padding only: use MLX pad with {low, high} pairs per axis
+    std::vector<std::pair<int, int>> padWidths;
+    padWidths.reserve(edgePaddingLow.size());
+    for (size_t i = 0; i < edgePaddingLow.size(); ++i) {
+        padWidths.emplace_back(static_cast<int>(edgePaddingLow[i]),
+                               static_cast<int>(edgePaddingHigh[i]));
+    }
+
+    values.emplace(ToKey(op->getResult(0)), mlx::core::pad(input, padWidths, padValue));
+    return true;
+}
+
+// Handler for stablehlo.dynamic_update_slice
+bool HandleDynamicUpdateSlice(mlir::Operation* op, ValueMap& values,
+                              std::vector<mlx::core::array>& outputs, ExecContext& ctx) {
+    auto dusOp = mlir::dyn_cast<mlir::stablehlo::DynamicUpdateSliceOp>(op);
+    if (!dusOp) {
+        MPS_LOG_ERROR("stablehlo.dynamic_update_slice: failed to cast\n");
+        return false;
+    }
+
+    auto operand_opt = GetValue(values, dusOp.getOperand());
+    auto update_opt = GetValue(values, dusOp.getUpdate());
+    if (!operand_opt || !update_opt) {
+        MPS_LOG_ERROR("stablehlo.dynamic_update_slice: operand not found in value map\n");
+        return false;
+    }
+
+    auto& operand = operand_opt->get();
+    auto& update = update_opt->get();
+
+    // Get start indices (each is a 0-d tensor)
+    std::vector<int> starts;
+    for (auto startIdx : dusOp.getStartIndices()) {
+        auto idx_opt = GetValue(values, startIdx);
+        if (!idx_opt) {
+            MPS_LOG_ERROR("stablehlo.dynamic_update_slice: start index not found\n");
+            return false;
+        }
+        // Evaluate to get the actual index value
+        mlx::core::eval(idx_opt->get());
+        starts.push_back(idx_opt->get().item<int>());
+    }
+
+    // Clamp start indices to valid range
+    mlx::core::Shape mlxStarts;
+    mlx::core::Shape mlxStops;
+    for (int i = 0; i < static_cast<int>(starts.size()); ++i) {
+        int maxStart = operand.shape(i) - update.shape(i);
+        int s = std::max(0, std::min(starts[i], maxStart));
+        mlxStarts.push_back(s);
+        mlxStops.push_back(s + update.shape(i));
+    }
+
+    values.emplace(ToKey(op->getResult(0)),
+                   mlx::core::slice_update(operand, update, mlxStarts, mlxStops));
+    return true;
+}
+
+// Handler for stablehlo.gather
+bool HandleGather(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::array>& outputs,
+                  ExecContext& ctx) {
+    auto gatherOp = mlir::dyn_cast<mlir::stablehlo::GatherOp>(op);
+    if (!gatherOp) {
+        MPS_LOG_ERROR("stablehlo.gather: failed to cast\n");
+        return false;
+    }
+
+    auto operand_opt = GetValue(values, gatherOp.getOperand());
+    auto indices_opt = GetValue(values, gatherOp.getStartIndices());
+    if (!operand_opt || !indices_opt) {
+        MPS_LOG_ERROR("stablehlo.gather: operand not found in value map\n");
+        return false;
+    }
+
+    auto& operand = operand_opt->get();
+    auto& startIndices = indices_opt->get();
+
+    auto dimNumbers = gatherOp.getDimensionNumbers();
+    auto collapsedSliceDims = dimNumbers.getCollapsedSliceDims();
+    auto startIndexMap = dimNumbers.getStartIndexMap();
+    auto indexVectorDim = static_cast<int>(dimNumbers.getIndexVectorDim());
+
+    // Simple case: single index dimension, single collapsed dim
+    // This handles the common pattern: gather(data, indices) -> data[indices]
+    if (startIndexMap.size() == 1 && collapsedSliceDims.size() == 1 &&
+        static_cast<int64_t>(startIndexMap[0]) == static_cast<int64_t>(collapsedSliceDims[0])) {
+        int gatherDim = static_cast<int>(startIndexMap[0]);
+
+        // Extract the index vector
+        auto indices = startIndices;
+        if (indexVectorDim < static_cast<int>(startIndices.shape().size())) {
+            // Index vector dim exists - squeeze it if it's size 1
+            if (startIndices.shape(indexVectorDim) == 1) {
+                indices = mlx::core::squeeze(startIndices, {indexVectorDim});
+            }
+        }
+
+        // Ensure indices are int32
+        if (indices.dtype() != mlx::core::int32) {
+            indices = mlx::core::astype(indices, mlx::core::int32);
+        }
+
+        auto result = mlx::core::take(operand, indices, gatherDim);
+
+        // Check if we need to rearrange dimensions to match the expected output layout
+        auto resultType = mlir::dyn_cast<mlir::RankedTensorType>(op->getResult(0).getType());
+        if (resultType) {
+            auto expectedShape = GetShape(resultType);
+            auto actualShape = result.shape();
+            if (actualShape != expectedShape) {
+                result = mlx::core::reshape(result, expectedShape);
+            }
+        }
+
+        values.emplace(ToKey(op->getResult(0)), std::move(result));
+        return true;
+    }
+
+    MPS_LOG_ERROR("stablehlo.gather: unsupported gather pattern (indexVectorDim=%d, "
+                  "startIndexMap.size=%zu, collapsedSliceDims.size=%zu)\n",
+                  indexVectorDim, startIndexMap.size(), collapsedSliceDims.size());
+    return false;
+}
+
 // Handler for stablehlo.constant
 bool HandleConstant(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::array>& outputs,
                     ExecContext& ctx) {
@@ -1025,8 +1382,11 @@ bool HandleBitcastConvert(mlir::Operation* op, ValueMap& values,
 }
 
 // Forward declaration for executing a region
+// parentValues allows inner regions to access values defined in outer scopes
+// (e.g., constants hoisted out of while-loop regions by optimization passes)
 bool ExecuteRegion(mlir::Region& region, std::vector<mlx::core::array>& args,
-                   std::vector<mlx::core::array>& results, ExecContext& ctx);
+                   std::vector<mlx::core::array>& results, ExecContext& ctx,
+                   const ValueMap* parentValues = nullptr);
 
 // Handler for stablehlo.return (region terminator)
 bool HandleStablehloReturn(mlir::Operation* op, ValueMap& values,
@@ -1058,9 +1418,9 @@ bool HandleWhile(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::a
     auto& bodyRegion = whileOp.getBody();
 
     while (true) {
-        // Execute condition region
+        // Execute condition region (pass parent values for outer-scope references)
         std::vector<mlx::core::array> condResults;
-        if (!ExecuteRegion(condRegion, loopVars, condResults, ctx)) {
+        if (!ExecuteRegion(condRegion, loopVars, condResults, ctx, &values)) {
             MPS_LOG_ERROR("stablehlo.while: failed to execute cond region\n");
             return false;
         }
@@ -1085,9 +1445,9 @@ bool HandleWhile(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::a
             break;
         }
 
-        // Execute body region
+        // Execute body region (pass parent values for outer-scope references)
         std::vector<mlx::core::array> bodyResults;
-        if (!ExecuteRegion(bodyRegion, loopVars, bodyResults, ctx)) {
+        if (!ExecuteRegion(bodyRegion, loopVars, bodyResults, ctx, &values)) {
             MPS_LOG_ERROR("stablehlo.while: failed to execute body region\n");
             return false;
         }
@@ -1105,6 +1465,49 @@ bool HandleWhile(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::a
     // Map final loop variables to results
     for (size_t i = 0; i < loopVars.size(); ++i) {
         values.emplace(ToKey(op->getResult(i)), std::move(loopVars[i]));
+    }
+
+    return true;
+}
+
+// Handler for stablehlo.case (implements lax.cond and lax.switch)
+bool HandleCase(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::array>& outputs,
+                ExecContext& ctx) {
+    auto caseOp = mlir::dyn_cast<mlir::stablehlo::CaseOp>(op);
+    if (!caseOp) {
+        MPS_LOG_ERROR("stablehlo.case: failed to cast\n");
+        return false;
+    }
+
+    // Get the branch index
+    auto index_opt = GetValue(values, caseOp.getIndex());
+    if (!index_opt) {
+        MPS_LOG_ERROR("stablehlo.case: index operand not found\n");
+        return false;
+    }
+
+    // Evaluate the index to determine which branch to take
+    mlx::core::eval(index_opt->get());
+    int branchIdx = index_opt->get().item<int>();
+
+    // Clamp to valid range (out-of-bounds goes to last branch per StableHLO spec)
+    int numBranches = static_cast<int>(caseOp.getBranches().size());
+    if (branchIdx < 0 || branchIdx >= numBranches) {
+        branchIdx = numBranches - 1;
+    }
+
+    // Execute the selected branch
+    auto& branch = caseOp.getBranches()[branchIdx];
+    std::vector<mlx::core::array> branchArgs;  // case branches take no args
+    std::vector<mlx::core::array> branchResults;
+    if (!ExecuteRegion(branch, branchArgs, branchResults, ctx, &values)) {
+        MPS_LOG_ERROR("stablehlo.case: failed to execute branch %d\n", branchIdx);
+        return false;
+    }
+
+    // Map branch results to op results
+    for (size_t i = 0; i < branchResults.size(); ++i) {
+        values.emplace(ToKey(op->getResult(i)), std::move(branchResults[i]));
     }
 
     return true;
@@ -1280,7 +1683,7 @@ std::string BuildEinsumSubscript(int lhsRank, int rhsRank, llvm::ArrayRef<int64_
 }
 
 // Helper to detect reduction type by analyzing the body region
-enum class ReduceType { Sum, Max, Min, Prod, Unknown };
+enum class ReduceType { Sum, Max, Min, Prod, And, Or, Unknown };
 
 ReduceType DetectReduceType(mlir::Region& body) {
     if (body.empty())
@@ -1297,6 +1700,10 @@ ReduceType DetectReduceType(mlir::Region& body) {
             return ReduceType::Min;
         if (opName == "stablehlo.multiply")
             return ReduceType::Prod;
+        if (opName == "stablehlo.and")
+            return ReduceType::And;
+        if (opName == "stablehlo.or")
+            return ReduceType::Or;
     }
     return ReduceType::Unknown;
 }
@@ -1345,6 +1752,12 @@ bool HandleReduce(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::
                 break;
             case ReduceType::Prod:
                 result = mlx::core::prod(input_opt->get(), axes);
+                break;
+            case ReduceType::And:
+                result = mlx::core::all(input_opt->get(), axes);
+                break;
+            case ReduceType::Or:
+                result = mlx::core::any(input_opt->get(), axes);
                 break;
             default:
                 MPS_LOG_ERROR("stablehlo.reduce: unsupported reduction type\n");
@@ -1778,12 +2191,25 @@ const std::unordered_map<std::string, OpHandler>& GetOpHandlers() {
         {"stablehlo.cosine", HandleCosine},
         {"stablehlo.clamp", HandleClamp},
         {"stablehlo.power", HandlePower},
+        {"stablehlo.tanh", HandleTanh},
+        {"stablehlo.tan", HandleTan},
+        {"stablehlo.sign", HandleSign},
+        {"stablehlo.remainder", HandleRemainder},
+        {"stablehlo.ceil", HandleCeil},
+        {"stablehlo.round_nearest_even", HandleRoundNearestEven},
+        {"stablehlo.is_finite", HandleIsFinite},
+        {"stablehlo.exponential_minus_one", HandleExpm1},
+        {"stablehlo.cbrt", HandleCbrt},
+        {"stablehlo.atan2", HandleAtan2},
         // Bitwise
         {"stablehlo.and", HandleAnd},
         {"stablehlo.or", HandleOr},
         {"stablehlo.xor", HandleXor},
+        {"stablehlo.not", HandleNot},
         {"stablehlo.shift_left", HandleShiftLeft},
         {"stablehlo.shift_right_logical", HandleShiftRightLogical},
+        {"stablehlo.shift_right_arithmetic", HandleShiftRightArithmetic},
+        {"stablehlo.popcnt", HandlePopcount},
         // Comparison/selection
         {"stablehlo.compare", HandleCompare},
         {"stablehlo.select", HandleSelect},
@@ -1799,6 +2225,9 @@ const std::unordered_map<std::string, OpHandler>& GetOpHandlers() {
         {"stablehlo.iota", HandleIota},
         {"stablehlo.slice", HandleSlice},
         {"stablehlo.dynamic_slice", HandleDynamicSlice},
+        {"stablehlo.dynamic_update_slice", HandleDynamicUpdateSlice},
+        {"stablehlo.pad", HandlePad},
+        {"stablehlo.gather", HandleGather},
         // Linear algebra
         {"stablehlo.dot_general", HandleDotGeneral},
         {"stablehlo.convolution", HandleConvolution},
@@ -1809,6 +2238,7 @@ const std::unordered_map<std::string, OpHandler>& GetOpHandlers() {
         {"func.call", HandleCall},
         {"stablehlo.custom_call", HandleCustomCall},
         {"stablehlo.while", HandleWhile},
+        {"stablehlo.case", HandleCase},
         {"stablehlo.return", HandleStablehloReturn},
     };
     return handlers;
@@ -1844,24 +2274,39 @@ bool DispatchOp(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::ar
 }
 
 // Execute a region (for while loops, etc.) with given inputs
+// parentValues allows inner regions to access values defined in outer scopes
+// (e.g., constants hoisted out of while-loop regions by optimization passes)
 bool ExecuteRegion(mlir::Region& region, std::vector<mlx::core::array>& args,
-                   std::vector<mlx::core::array>& results, ExecContext& ctx) {
+                   std::vector<mlx::core::array>& results, ExecContext& ctx,
+                   const ValueMap* parentValues) {
     if (region.empty()) {
         MPS_LOG_ERROR("ExecuteRegion: empty region\n");
         return false;
     }
 
+    // Use a local ValueMap that falls back to parentValues for lookups.
+    // We achieve this by wrapping GetValue lookups: local values first, then parent.
+    // For simplicity, we create a combined map by inserting references to parent values.
     ValueMap values;
+
+    // Insert parent values by reference (shallow copy of mlx::core::array is fine)
+    if (parentValues) {
+        for (const auto& kv : *parentValues) {
+            values.emplace(kv.first, kv.second);
+        }
+    }
+
     auto& block = region.front();
 
-    // Map block arguments to input arrays
+    // Map block arguments to input arrays (may shadow parent values)
     size_t argIdx = 0;
     for (auto arg : block.getArguments()) {
         if (argIdx >= args.size()) {
             MPS_LOG_ERROR("ExecuteRegion: not enough arguments\n");
             return false;
         }
-        values.emplace(ToKey(arg), args[argIdx]);
+        // Use insert_or_assign to shadow any parent value with the same key
+        values.insert_or_assign(ToKey(arg), args[argIdx]);
         argIdx++;
     }
 
