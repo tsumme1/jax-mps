@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <functional>
+#include <set>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -2453,6 +2454,106 @@ bool HandleScatter(mlir::Operation* op, ValueMap& values, std::vector<mlx::core:
     // Detect update type
     auto& body = scatterOp.getUpdateComputation();
     auto scatterType = DetectScatterType(body);
+
+    auto inputBatchingDims = dimNumbers.getInputBatchingDims();
+    auto scatterIndicesBatchingDims = dimNumbers.getScatterIndicesBatchingDims();
+
+    // Batched scatter: each batch element scatters independently.
+    // We use multi-axis scatter with iota indices for batch dims.
+    if (!inputBatchingDims.empty()) {
+        // Squeeze index_vector_dim if size 1
+        auto indices = scatterIndices;
+        if (indexVectorDim < static_cast<int>(indices.shape().size()) &&
+            indices.shape(indexVectorDim) == 1) {
+            indices = mlx::core::squeeze(indices, {indexVectorDim});
+        }
+        if (indices.dtype() != mlx::core::int32) {
+            indices = mlx::core::astype(indices, mlx::core::int32);
+        }
+
+        // Build axes and index arrays: scatter dims + batch dims
+        std::vector<int> axes;
+        std::vector<mlx::core::array> idxVec;
+
+        // Add scatter dim indices
+        for (auto dim : scatterDimsToOperandDims) {
+            axes.push_back(static_cast<int>(dim));
+        }
+        idxVec.push_back(indices);
+
+        // Add batch dim iota indices
+        for (size_t i = 0; i < inputBatchingDims.size(); ++i) {
+            int batchAxis = static_cast<int>(inputBatchingDims[i]);
+            axes.push_back(batchAxis);
+
+            // Create iota for this batch dimension, broadcast to indices shape
+            int batchSize = operand.shape(batchAxis);
+            mlx::core::Shape iotaShape(indices.ndim(), 1);
+
+            // Find which dim in indices corresponds to this batch dim
+            int idxBatchDim = static_cast<int>(scatterIndicesBatchingDims[i]);
+            // Adjust for squeezed index_vector_dim
+            if (indexVectorDim < idxBatchDim) {
+                --idxBatchDim;
+            }
+            iotaShape[idxBatchDim] = batchSize;
+
+            auto batchIota = mlx::core::reshape(mlx::core::arange(batchSize), iotaShape);
+            batchIota = mlx::core::broadcast_to(batchIota, indices.shape());
+            idxVec.push_back(batchIota);
+        }
+
+        // Reshape updates: (idx_shape..., operand_shape_with_1_at_covered_dims...)
+        // Covered dims = scatter dims + batch dims + inserted window dims
+        std::set<int> coveredDims;
+        for (auto d : scatterDimsToOperandDims) {
+            coveredDims.insert(static_cast<int>(d));
+        }
+        for (auto d : inputBatchingDims) {
+            coveredDims.insert(static_cast<int>(d));
+        }
+        for (auto d : insertedWindowDims) {
+            coveredDims.insert(static_cast<int>(d));
+        }
+
+        auto updShape = updates.shape();
+        mlx::core::Shape newShape(updShape.begin(), updShape.end());
+        for (int dim = 0; dim < static_cast<int>(operand.ndim()); ++dim) {
+            if (coveredDims.count(dim) != 0) {
+                newShape.push_back(1);
+            } else {
+                // Window dim — find size from update_window_dims
+                // For simplicity, get it from the expected output type
+                newShape.push_back(operand.shape(dim));
+            }
+        }
+        auto reshapedUpdates = mlx::core::reshape(updates, newShape);
+
+        mlx::core::array result = operand;
+        switch (scatterType) {
+            case ScatterType::Update:
+                result = mlx::core::scatter(operand, idxVec, reshapedUpdates, axes);
+                break;
+            case ScatterType::Add:
+                result = mlx::core::scatter_add(operand, idxVec, reshapedUpdates, axes);
+                break;
+            case ScatterType::Mul:
+                result = mlx::core::scatter_prod(operand, idxVec, reshapedUpdates, axes);
+                break;
+            case ScatterType::Min:
+                result = mlx::core::scatter_min(operand, idxVec, reshapedUpdates, axes);
+                break;
+            case ScatterType::Max:
+                result = mlx::core::scatter_max(operand, idxVec, reshapedUpdates, axes);
+                break;
+            default:
+                MPS_LOG_ERROR("stablehlo.scatter: unsupported scatter update type (batched)\n");
+                return false;
+        }
+
+        values.emplace(ToKey(op->getResult(0)), std::move(result));
+        return true;
+    }
 
     // Simple case: 1D scatter with single scatter dim
     if (scatterDimsToOperandDims.size() == 1 && insertedWindowDims.size() == 1) {
