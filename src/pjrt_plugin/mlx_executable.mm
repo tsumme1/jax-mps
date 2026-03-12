@@ -1837,9 +1837,10 @@ bool IsIdentityPermutation(const std::vector<int>& perm) {
     return true;
 }
 
-// Check if einsum should be used for dot_general (MPS_USE_EINSUM=1)
+// Use einsum for dot_general by default (single fused op vs transpose+reshape+matmul+reshape).
+// Disable with MPS_NO_EINSUM=1 to fall back to the manual path.
 bool UseEinsumForDotGeneral() {
-    static bool use_einsum = std::getenv("MPS_USE_EINSUM") != nullptr;
+    static bool use_einsum = std::getenv("MPS_NO_EINSUM") == nullptr;
     return use_einsum;
 }
 
