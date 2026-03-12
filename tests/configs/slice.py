@@ -4,7 +4,7 @@ import pytest
 from jax import lax, random
 from jax import numpy as jnp
 
-from .util import OperationTestConfig
+from .util import OperationTestConfig, xfail_match
 
 
 def make_slice_op_configs():
@@ -170,14 +170,9 @@ def make_slice_op_configs():
                     lambda key: random.normal(key, (3, 10)),
                     lambda key: random.randint(key, (3,), 0, 10),
                     name="batched_single_axis_gather",
-                    grad_xfail="scatter:.+general fallback requires insertedWindowDims",
+                    grad_xfail="Output count mismatch",
                 ),
-                marks=[
-                    pytest.mark.xfail(
-                        reason="Batched gather not yet supported on MLX backend",
-                        strict=True,
-                    )
-                ],
+                marks=[xfail_match("Output count mismatch")],
             ),
             # Large integer gather tests: verify integers > 2^24 are preserved
             # These test the bitcast workaround for MPS gather operations

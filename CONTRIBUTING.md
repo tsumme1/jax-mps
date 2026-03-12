@@ -23,16 +23,12 @@ Pre-commit hooks run clang-format, ruff, pyright, a rebuild, and the full test s
 
 ## Adding a new operation
 
-> **Note:** The backend is being migrated from MPSGraph to MLX. On the `mlx-migration-*` branches, follow the MLX pattern below. On `main`, follow the MPSGraph pattern (see git history).
-
-### MLX Backend (current development)
-
 1. **Find the MLX function matching the operation.** See the [MLX C++ documentation](https://ml-explore.github.io/mlx/build/html/python/ops.html) (Python API mirrors C++).
 
 2. **Add a handler function** in `src/pjrt_plugin/mlx_executable.mm`:
 
 ```cpp
-bool HandleCosine(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::array>& outputs) {
+bool HandleCosine(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::array>& outputs, ExecContext& ctx) {
     auto input_opt = GetValue(values, op->getOperand(0));
     if (!input_opt) {
         MPS_LOG_ERROR("stablehlo.cosine: operand not found\n");
@@ -49,11 +45,11 @@ bool HandleCosine(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::
 {"stablehlo.cosine", HandleCosine},
 ```
 
-4. **Register the op name** in `src/pjrt_plugin/ops/registry.h` in `GetRegisteredOps()`.
+Op names are auto-derived from `GetOpHandlers()`, so no separate registration is needed.
 
-5. **Add a test config.** Every op needs an `OperationTestConfig` entry in the appropriate file under `tests/configs/`. See `tests/configs/unary.py` for the pattern.
+4. **Add a test config.** Every op needs an `OperationTestConfig` entry in the appropriate file under `tests/configs/`. See `tests/configs/unary.py` for the pattern.
 
-6. **Rebuild and test.** C++ changes require a rebuild.
+5. **Rebuild and test.** C++ changes require a rebuild.
 
 ```bash
 uv pip install -e .

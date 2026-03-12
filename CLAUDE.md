@@ -37,14 +37,13 @@ Tests, linting, and compilation on the `main` branch and in Continuous Integrati
    }
    ```
 
-4. Register the handler in `GetOpHandlers()`:
+4. Register the handler in `GetOpHandlers()` in `src/pjrt_plugin/mlx_executable.mm`:
    ```cpp
    {"stablehlo.multiply", HandleMultiply},
    ```
+   Op names are auto-derived from `GetOpHandlers()`, so no separate registration is needed.
 
-5. Register the op name in `src/pjrt_plugin/ops/registry.h` in `GetRegisteredOps()`.
-
-6. Rebuild with `uv pip install -e .` and run tests.
+5. Rebuild with `uv pip install -e .` and run tests.
 
 # Build and Test
 

@@ -193,21 +193,25 @@ def assert_all_ops_tested():
     pjrt_dir = Path(__file__).parent.parent / "src/pjrt_plugin"
     assert pjrt_dir.is_dir()
 
-    # Ops that appear in StableHLO IR but get lowered by MLIR/StableHLO
-    # optimization passes before reaching our handlers.
+    # Ops that appear in JAX's lowered IR text (which we scan to populate
+    # EXERCISED_STABLEHLO_OPS) but never reach our dispatch loop. CHLO ops
+    # are legalized by JAX before serialization—simple ones become
+    # stablehlo.custom_call(@mhlo.*), complex ones get expanded to
+    # polynomial approximations. StableHLO ops listed here are similarly
+    # lowered to more primitive ops before reaching us.
     mlir_lowered_ops = {
-        "chlo.lgamma",
-        "chlo.digamma",
-        "chlo.bessel_i1e",
-        # CHLO ops lowered to StableHLO by optimization passes
+        # CHLO ops legalized by JAX before serialization
         "chlo.acos",
         "chlo.acosh",
         "chlo.asin",
         "chlo.asinh",
         "chlo.atanh",
+        "chlo.bessel_i1e",
         "chlo.cosh",
+        "chlo.digamma",
         "chlo.erf",
         "chlo.erf_inv",
+        "chlo.lgamma",
         "chlo.next_after",
         "chlo.sinh",
         "chlo.square",

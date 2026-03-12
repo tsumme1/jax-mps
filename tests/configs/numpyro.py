@@ -217,25 +217,14 @@ def make_numpyro_op_configs():
                     ),  # concentration
                 ),
                 # Multivariate distributions.
-                # Batched MultivariateNormal grad hits unsupported scatter.
-                pytest.param(
-                    NumpyroDistributionTestConfig(
-                        dists.MultivariateNormal,
-                        lambda key, bs=batch_shape: random.normal(
-                            key, bs + (4,)
-                        ),  # loc
-                        None,  # covariance_matrix
-                        None,  # precision_matrix
-                        lambda key: jnp.linalg.cholesky(jnp.eye(4) + jnp.ones((4, 4))),
-                    ),
-                    marks=[
-                        pytest.mark.xfail(
-                            reason="Batched grad hits unsupported scatter",
-                            strict=False,
-                        )
-                    ]
-                    if batch_shape
-                    else [],
+                # Batched cases hit unsupported scatter in grad.
+                NumpyroDistributionTestConfig(
+                    dists.MultivariateNormal,
+                    lambda key, bs=batch_shape: random.normal(key, bs + (4,)),  # loc
+                    None,  # covariance_matrix
+                    None,  # precision_matrix
+                    lambda key: jnp.linalg.cholesky(jnp.eye(4) + jnp.ones((4, 4))),
+                    grad_xfail="Output count mismatch" if batch_shape else None,
                 ),
                 pytest.param(
                     NumpyroDistributionTestConfig(
@@ -250,13 +239,6 @@ def make_numpyro_op_configs():
                             key, 5.0, bs + (4,)
                         ),  # cov_diag
                     ),
-                    marks=[
-                        pytest.mark.xfail(
-                            reason="Batched case hits unsupported scatter",
-                            strict=False,
-                        )
-                    ]
-                    if batch_shape
-                    else [],
+                    marks=[xfail_match("Output count mismatch")] if batch_shape else [],
                 ),
             ]

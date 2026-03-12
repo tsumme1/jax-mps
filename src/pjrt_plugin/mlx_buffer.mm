@@ -38,16 +38,16 @@ mlx::core::Dtype PjrtDtypeToMlx(int dtype) {
         case PJRT_Buffer_Type_PRED:
             return mlx::core::bool_;
         case PJRT_Buffer_Type_F64:
-            MPS_LOG_ERROR("MLX does not support float64 (F64)\n");
-            return mlx::core::float32;
+            throw std::runtime_error("MLX does not support float64 (F64). Use "
+                                     "jax.config.update('jax_enable_x64', False) "
+                                     "or ensure your arrays are float32.");
         case PJRT_Buffer_Type_C64:
             return mlx::core::complex64;
         case PJRT_Buffer_Type_C128:
             MPS_LOG_WARN("MLX does not support complex128, downcast to complex64\n");
             return mlx::core::complex64;
         default:
-            MPS_LOG_ERROR("Unsupported PJRT dtype %d\n", dtype);
-            return mlx::core::float32;
+            throw std::runtime_error("Unsupported PJRT dtype: " + std::to_string(dtype));
     }
 }
 

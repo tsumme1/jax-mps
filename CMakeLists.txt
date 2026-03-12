@@ -116,10 +116,13 @@ set(MLX_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
 set(MLX_BUILD_PYTHON_BINDINGS OFF CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
+file(READ ${CMAKE_CURRENT_SOURCE_DIR}/third_party/mlx/version.txt MLX_GIT_TAG)
+string(STRIP "${MLX_GIT_TAG}" MLX_GIT_TAG)
+
 FetchContent_Declare(
     mlx
     GIT_REPOSITORY https://github.com/ml-explore/mlx.git
-    GIT_TAG v0.30.0
+    GIT_TAG ${MLX_GIT_TAG}
     PATCH_COMMAND git checkout -- . && git clean -fd && git apply --verbose
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party/mlx/patches/01-linalg-gpu-support.patch
 )
