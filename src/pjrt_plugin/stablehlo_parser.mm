@@ -31,9 +31,15 @@ namespace mps {
 
 namespace {
 
-// Set of supported operation names - derived from GetOpHandlers in mlx_executable.mm
+// Set of supported operation names - derived from OpRegistry plus runtime-lowered ops
 const std::unordered_set<std::string>& getSupportedOps() {
-    static std::unordered_set<std::string> supported = jax_mps::OpRegistry::GetRegisteredOps();
+    static std::unordered_set<std::string> supported = []() {
+        auto ops = jax_mps::OpRegistry::GetRegisteredOps();
+        // Add ops handled directly in mlx_executable.mm (not via OpRegistry).
+        ops.insert("func.return");
+        ops.insert("func.call");
+        return ops;
+    }();
     return supported;
 }
 
@@ -64,10 +70,6 @@ bool runOptimizationPasses(mlir::MLIRContext& context, mlir::ModuleOp module) {
     // Algebraic simplification: x*1 -> x, x+0 -> x, etc.
     pm.addNestedPass<mlir::func::FuncOp>(
         mlir::stablehlo::createStablehloAggressiveSimplificationPass());
-    // NOTE: The aggressive folder pass (constant folding) is intentionally excluded.
-    // It causes execution hangs with certain patterns (e.g., cholesky gradient in eager
-    // mode) due to folded broadcast_in_dim+constant patterns that create issues in the
-    // MPS Graph while-loop execution.
 
     if (mlir::failed(pm.run(module))) {
         NSLog(@"ERROR: StableHLO optimization pass failed. The module may be in a partially "
