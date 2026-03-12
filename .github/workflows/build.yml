@@ -67,6 +67,7 @@ jobs:
         uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.13"
+          prune-cache: false
 
       - name: Restore deps from cache
         uses: actions/cache/restore@v5
@@ -102,6 +103,7 @@ jobs:
         uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.13"
+          prune-cache: false
 
       - name: Restore deps from cache
         uses: actions/cache/restore@v5
@@ -139,6 +141,7 @@ jobs:
         uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.13"
+          prune-cache: false
 
       - name: Download wheel
         uses: actions/download-artifact@v8
@@ -172,6 +175,7 @@ jobs:
         uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.13"
+          prune-cache: false
 
       - name: Restore deps from cache
         uses: actions/cache/restore@v5
@@ -207,6 +211,7 @@ jobs:
         uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.13"
+          prune-cache: false
 
       - name: Download wheel
         uses: actions/download-artifact@v8
