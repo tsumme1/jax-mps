@@ -19,6 +19,7 @@
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
+#include "pjrt_plugin/logging.h"
 #include "pjrt_plugin/ops/registry.h"
 #include "stablehlo/dialect/ChloOps.h"
 #include "stablehlo/dialect/Serialization.h"
@@ -34,7 +35,7 @@ namespace {
 const std::unordered_set<std::string>& getSupportedOps() {
     static std::unordered_set<std::string> supported = []() {
         auto ops = jax_mps::OpRegistry::GetRegisteredOps();
-        // Add ops handled directly in mps_executable.mm (not via OpRegistry).
+        // Add ops handled directly in mlx_executable.mm (not via OpRegistry).
         ops.insert("func.return");
         ops.insert("func.call");
         return ops;
@@ -69,10 +70,6 @@ bool runOptimizationPasses(mlir::MLIRContext& context, mlir::ModuleOp module) {
     // Algebraic simplification: x*1 -> x, x+0 -> x, etc.
     pm.addNestedPass<mlir::func::FuncOp>(
         mlir::stablehlo::createStablehloAggressiveSimplificationPass());
-    // NOTE: The aggressive folder pass (constant folding) is intentionally excluded.
-    // It causes execution hangs with certain patterns (e.g., cholesky gradient in eager
-    // mode) due to folded broadcast_in_dim+constant patterns that create issues in the
-    // MPS Graph while-loop execution.
 
     if (mlir::failed(pm.run(module))) {
         NSLog(@"ERROR: StableHLO optimization pass failed. The module may be in a partially "
@@ -97,8 +94,10 @@ bool runInlinerPass(mlir::MLIRContext& context, mlir::ModuleOp module) {
     mlir::PassManager pm(&context);
     pm.addPass(mlir::createInlinerPass());
 
-    // Ignore errors from inliner - we'll handle func.call at runtime
-    (void)pm.run(module);
+    // If inliner fails, log but continue - we handle func.call at runtime
+    if (mlir::failed(pm.run(module))) {
+        MPS_LOG_DEBUG("Inliner pass failed, func.call ops will be handled at runtime\n");
+    }
     return true;
 }
 

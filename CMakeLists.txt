@@ -26,7 +26,6 @@ add_compile_options(-isysroot ${MACOS_SDK_PATH})
 # Find required Apple frameworks
 find_library(METAL_FRAMEWORK Metal REQUIRED)
 find_library(MPS_FRAMEWORK MetalPerformanceShaders REQUIRED)
-find_library(MPSGRAPH_FRAMEWORK MetalPerformanceShadersGraph REQUIRED)
 find_library(FOUNDATION_FRAMEWORK Foundation REQUIRED)
 
 # XLA PJRT headers (installed by setup_deps.sh)
@@ -106,6 +105,32 @@ find_library(STABLEHLO_PASS_UTILS_LIB StablehloPassUtils HINTS ${CMAKE_PREFIX_PA
 find_library(STABLEHLO_TYPE_CONVERSION_LIB StablehloTypeConversion HINTS ${CMAKE_PREFIX_PATH} PATH_SUFFIXES lib)
 find_library(VERSION_LIB Version HINTS ${CMAKE_PREFIX_PATH} PATH_SUFFIXES lib)
 
+# MLX as external project
+include(FetchContent)
+
+# Set MLX_VERSION before FetchContent so it's available during MLX's project() call
+set(MLX_VERSION "0.30.0" CACHE STRING "MLX version" FORCE)
+set(MLX_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(MLX_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(MLX_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
+set(MLX_BUILD_PYTHON_BINDINGS OFF CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+
+file(READ ${CMAKE_CURRENT_SOURCE_DIR}/third_party/mlx/version.txt MLX_GIT_TAG)
+string(STRIP "${MLX_GIT_TAG}" MLX_GIT_TAG)
+
+FetchContent_Declare(
+    mlx
+    GIT_REPOSITORY https://github.com/ml-explore/mlx.git
+    GIT_TAG ${MLX_GIT_TAG}
+    PATCH_COMMAND git checkout -- . && git clean -fd && git apply --verbose
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/mlx/patches/01-linalg-gpu-support.patch
+)
+FetchContent_MakeAvailable(mlx)
+
+# Link MetalPerformanceShaders to MLX for our GPU linalg patch.
+target_link_libraries(mlx PRIVATE ${MPS_FRAMEWORK})
+
 # Source files
 set(PJRT_SOURCES
     src/pjrt_plugin/pjrt_api.cc
@@ -116,23 +141,12 @@ set(PJRT_SOURCES
     src/pjrt_plugin/pjrt_executable.cc
     src/pjrt_plugin/pjrt_event.cc
     src/pjrt_plugin/pjrt_topology.cc
-    src/pjrt_plugin/mps_client.mm
-    src/pjrt_plugin/mps_device.mm
-    src/pjrt_plugin/mps_buffer.mm
-    src/pjrt_plugin/mps_executable.mm
     src/pjrt_plugin/stablehlo_parser.mm
     src/pjrt_plugin/type_utils.mm
-    src/pjrt_plugin/ops/binary_ops.mm
-    src/pjrt_plugin/ops/unary_ops.mm
-    src/pjrt_plugin/ops/shape_ops.mm
-    src/pjrt_plugin/ops/bitwise_ops.mm
-    src/pjrt_plugin/ops/fft_ops.mm
-    src/pjrt_plugin/ops/tensor_creation_ops.mm
-    src/pjrt_plugin/ops/convolution_ops.mm
-    src/pjrt_plugin/ops/reduction_ops.mm
-    src/pjrt_plugin/ops/control_flow_ops.mm
-    src/pjrt_plugin/ops/sort_ops.mm
-    src/pjrt_plugin/ops/linalg_ops.mm
+    src/pjrt_plugin/mlx_client.mm
+    src/pjrt_plugin/mlx_device.mm
+    src/pjrt_plugin/mlx_buffer.mm
+    src/pjrt_plugin/mlx_executable.mm
     ${PROTO_SRCS}
 )
 
@@ -241,13 +255,13 @@ endif()
 target_link_libraries(pjrt_plugin_mps PRIVATE
     ${METAL_FRAMEWORK}
     ${MPS_FRAMEWORK}
-    ${MPSGRAPH_FRAMEWORK}
     ${FOUNDATION_FRAMEWORK}
     ${STABLEHLO_LIBS}
     ${MLIR_LIBS}
     protobuf::libprotobuf
     ${UTF8_LIBS}
     ${ABSL_LIBS}
+    mlx
 )
 
 # For wheel distribution: ensure RPATH is set correctly
