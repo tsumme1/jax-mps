@@ -15,7 +15,7 @@ jobs:
     outputs:
       wheel: ${{ steps.filter.outputs.wheel }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dorny/paths-filter@v3
         id: filter
         with:
@@ -30,11 +30,11 @@ jobs:
     name: Setup dependencies
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Restore deps from cache
         id: cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: ${{ github.workspace }}/.jax-mps-deps
           key: mlir-stablehlo-v2-macos14-${{ hashFiles('scripts/setup_deps.sh') }}
@@ -51,7 +51,7 @@ jobs:
 
       - name: Save cache
         if: steps.cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: ${{ github.workspace }}/.jax-mps-deps
           key: mlir-stablehlo-v2-macos14-${{ hashFiles('scripts/setup_deps.sh') }}
@@ -61,15 +61,15 @@ jobs:
     needs: setup-deps
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.13"
 
       - name: Restore deps from cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: ${{ github.workspace }}/.jax-mps-deps
           key: mlir-stablehlo-v2-macos14-${{ hashFiles('scripts/setup_deps.sh') }}
@@ -86,7 +86,7 @@ jobs:
           CMAKE_PREFIX_PATH: ${{ github.workspace }}/.jax-mps-deps
 
       - name: Upload wheel
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheel
           path: dist/*.whl
@@ -96,15 +96,15 @@ jobs:
     needs: setup-deps
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.13"
 
       - name: Restore deps from cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: ${{ github.workspace }}/.jax-mps-deps
           key: mlir-stablehlo-v2-macos14-${{ hashFiles('scripts/setup_deps.sh') }}
@@ -133,15 +133,15 @@ jobs:
     needs: build
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.13"
 
       - name: Download wheel
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: wheel
           path: dist/
@@ -166,15 +166,15 @@ jobs:
     runs-on: macos-14
     if: github.ref == 'refs/heads/main' && github.event_name == 'push' && needs.changes.outputs.wheel == 'true'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.13"
 
       - name: Restore deps from cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: ${{ github.workspace }}/.jax-mps-deps
           key: mlir-stablehlo-v2-macos14-${{ hashFiles('scripts/setup_deps.sh') }}
@@ -191,7 +191,7 @@ jobs:
           CMAKE_PREFIX_PATH: ${{ github.workspace }}/.jax-mps-deps
 
       - name: Upload dev wheel
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheel-dev
           path: dist/*.whl
@@ -201,15 +201,15 @@ jobs:
     needs: build
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.13"
 
       - name: Download wheel
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: wheel
           path: dist/
@@ -246,13 +246,13 @@ jobs:
       contents: write
     steps:
       - name: Download wheel
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: wheel
           path: dist/
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: dist/*.whl
           generate_release_notes: true
@@ -269,7 +269,7 @@ jobs:
       id-token: write
     steps:
       - name: Download dev wheel
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: wheel-dev
           path: dist/
