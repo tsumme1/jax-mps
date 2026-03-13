@@ -1,6 +1,5 @@
 import jax
 import numpy
-import pytest
 from jax import lax, random
 from jax import numpy as jnp
 
@@ -169,7 +168,6 @@ def make_slice_op_configs():
                 lambda key: random.normal(key, (3, 10)),
                 lambda key: random.randint(key, (3,), 0, 10),
                 name="batched_single_axis_gather",
-                grad_xfail="Output count mismatch",
             ),
             # Batched gather via vmap with no collapsed dims (issue #74)
             OperationTestConfig(
@@ -179,7 +177,6 @@ def make_slice_op_configs():
                 lambda key: random.normal(key, (4, 5)),
                 lambda key: random.randint(key, (4,), 0, 5),
                 name="batched_gather_no_collapse",
-                grad_xfail="Output count mismatch",
             ),
             # Large integer gather tests: verify integers > 2^24 are preserved
             # These test the bitcast workaround for MPS gather operations
@@ -257,48 +254,69 @@ def make_slice_op_configs():
             # Batched scatter using vmap - tests numStableHLOBatch > 0
             # These crash due to incorrect handling of StableHLO batch dimensions
             # in the general scatter fallback (reshape loses batch dims). See PR #49.
-            pytest.param(
-                OperationTestConfig(
-                    lambda x, idx, val: jax.vmap(lambda a, i, v: a.at[i].set(v))(
-                        x, idx, val
-                    ),
-                    lambda key: random.normal(key, (3, 5)),
-                    lambda key: random.randint(key, (3,), 0, 5),
-                    lambda key: random.normal(key, (3,)),
-                    differentiable_argnums=(0, 2),
-                    name="scatter_vmap_simple",
+            OperationTestConfig(
+                lambda x, idx, val: jax.vmap(lambda a, i, v: a.at[i].set(v))(
+                    x, idx, val
                 ),
-                marks=[
-                    pytest.mark.skip(reason="FIXME: crashes due to batched scatter bug")
-                ],
+                lambda key: random.normal(key, (3, 5)),
+                lambda key: random.randint(key, (3,), 0, 5),
+                lambda key: random.normal(key, (3,)),
+                differentiable_argnums=(0, 2),
+                name="scatter_vmap_simple",
             ),
-            pytest.param(
-                OperationTestConfig(
-                    lambda x, idx, val: jax.vmap(lambda a, i, v: a.at[i].add(v))(
-                        x, idx, val
-                    ),
-                    lambda key: jnp.zeros((3, 5), dtype=jnp.float32),
-                    lambda key: jnp.array([[0, 2], [1, 3], [2, 4]]),
-                    lambda key: random.normal(key, (3, 2)),
-                    differentiable_argnums=(0, 2),
-                    name="scatter_vmap_multi_point",
+            OperationTestConfig(
+                lambda x, idx, val: jax.vmap(lambda a, i, v: a.at[i].add(v))(
+                    x, idx, val
                 ),
-                marks=[
-                    pytest.mark.skip(reason="FIXME: crashes due to batched scatter bug")
-                ],
+                lambda key: jnp.zeros((3, 5), dtype=jnp.float32),
+                lambda key: jnp.array([[0, 2], [1, 3], [2, 4]]),
+                lambda key: random.normal(key, (3, 2)),
+                differentiable_argnums=(0, 2),
+                name="scatter_vmap_multi_point",
             ),
-            pytest.param(
-                OperationTestConfig(
-                    lambda x, vals: jax.vmap(
-                        lambda a, v: a.at[numpy.arange(2), numpy.arange(2)].add(v)
-                    )(x, vals),
-                    lambda key: jnp.zeros((3, 4, 4), dtype=jnp.float32),
-                    lambda key: random.normal(key, (3, 2)),
-                    differentiable_argnums=(0,),
-                    name="scatter_vmap_2d_diagonal",
+            OperationTestConfig(
+                lambda x, vals: jax.vmap(
+                    lambda a, v: a.at[numpy.arange(2), numpy.arange(2)].add(v)
+                )(x, vals),
+                lambda key: jnp.zeros((3, 4, 4), dtype=jnp.float32),
+                lambda key: random.normal(key, (3, 2)),
+                differentiable_argnums=(0,),
+                name="scatter_vmap_2d_diagonal",
+            ),
+            # Partial-index gather with non-sorted startIndexMap.
+            # start_index_map=(2, 0) means idx[0]->dim2, idx[1]->dim0.
+            # Strides must follow sorted collapsed-dim order, not startIndexMap order.
+            # Indices [3, 2] select dim2=3, dim0=2 => x[2, :, 3].
+            # With shape (3,4,5), wrong strides give linear idx 11 instead of 13.
+            OperationTestConfig(
+                lambda x: lax.gather(
+                    x,
+                    jnp.array([[3, 2]]),
+                    dimension_numbers=lax.GatherDimensionNumbers(
+                        offset_dims=(1,),
+                        collapsed_slice_dims=(0, 2),
+                        start_index_map=(2, 0),
+                    ),
+                    slice_sizes=(1, 4, 1),
                 ),
-                marks=[
-                    pytest.mark.skip(reason="FIXME: crashes due to batched scatter bug")
-                ],
+                lambda key: random.normal(key, (3, 4, 5)),
+                name="partial_gather_reversed_index_map",
+            ),
+            # Fix 3: Partial-index gather with scalar indices.
+            # indices shape [2] with indexVectorDim=0 => each sub-index is scalar.
+            # linearIdx must be padded to match flatOperand.ndim() for take_along_axis.
+            OperationTestConfig(
+                lambda x: lax.gather(
+                    x,
+                    jnp.array([1, 0]),
+                    dimension_numbers=lax.GatherDimensionNumbers(
+                        offset_dims=(0,),
+                        collapsed_slice_dims=(0, 2),
+                        start_index_map=(0, 2),
+                    ),
+                    slice_sizes=(1, 4, 1),
+                ),
+                lambda key: random.normal(key, (3, 4, 5)),
+                name="partial_gather_scalar_indices",
             ),
         ]

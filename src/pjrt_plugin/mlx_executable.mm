@@ -958,7 +958,17 @@ bool HandleGather(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::
             if (!operandBatchingDims.empty()) {
                 // Batched gather: use take_along_axis which naturally handles
                 // per-element indexing (result[b,i] = operand[b, indices[b,i]]).
-                return mlx::core::take_along_axis(operand, indices, gatherDim);
+                // take_along_axis requires indices to have the same ndim as operand.
+                // Append trailing size-1 dims for any offset dims beyond the gather axis.
+                auto batchedIndices = indices;
+                if (batchedIndices.ndim() < operand.ndim()) {
+                    mlx::core::Shape expandedShape = batchedIndices.shape();
+                    while (static_cast<int>(expandedShape.size()) < operand.ndim()) {
+                        expandedShape.push_back(1);
+                    }
+                    batchedIndices = mlx::core::reshape(batchedIndices, expandedShape);
+                }
+                return mlx::core::take_along_axis(operand, batchedIndices, gatherDim);
             }
             return mlx::core::take(operand, indices, gatherDim);
         }();
@@ -977,24 +987,21 @@ bool HandleGather(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::
         return true;
     }
 
-    // Multi-dim gather: all dims collapsed (full index gather)
+    // Multi-dim gather: multiple start_index_map dims, all collapsed
     // This handles patterns like operand[idx[0], idx[1], ..., idx[N-1]]
-    // where indexVectorDim points to the axis containing per-dim indices
+    // where indexVectorDim points to the axis containing per-dim indices.
+    // When offset_dims is non-empty, some operand dims are preserved in output.
     if (startIndexMap.size() == collapsedSliceDims.size() && startIndexMap.size() > 1) {
-        // Extract per-axis indices by slicing along the index vector dim
         auto indices = startIndices;
-
-        // Determine batch shape (all dims except indexVectorDim)
         auto idxShape = indices.shape();
 
-        // Build per-axis index arrays
+        // Build per-axis index arrays and extract from index_vector_dim
         std::vector<mlx::core::array> idxVec;
         std::vector<int> axes;
         for (size_t i = 0; i < startIndexMap.size(); ++i) {
             int axis = static_cast<int>(startIndexMap[i]);
             axes.push_back(axis);
 
-            // Slice the index vector dim to get indices for this axis
             mlx::core::Shape starts(indices.ndim(), 0);
             mlx::core::Shape stops(idxShape.begin(), idxShape.end());
             starts[indexVectorDim] = static_cast<int>(i);
@@ -1004,44 +1011,108 @@ bool HandleGather(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::
             if (axisIndices.dtype() != mlx::core::int32) {
                 axisIndices = mlx::core::astype(axisIndices, mlx::core::int32);
             }
+            // Clamp to valid range
+            axisIndices =
+                mlx::core::clip(axisIndices, mlx::core::array(0, mlx::core::int32),
+                                mlx::core::array(operand.shape(axis) - 1, mlx::core::int32));
             idxVec.push_back(axisIndices);
         }
 
-        // Use gather to extract values at the specified indices
-        // For full-index gather, each index set picks a single scalar from operand
-        // We need operand[idx0, idx1, ...] which is gather with all axes
-        auto result = operand;
-        // Apply takes sequentially for each axis
-        // Actually use the multi-axis indexing: reshape indices for advanced indexing
-        // For a scalar gather: idxVec has N scalar arrays, just do nested take
-        // For batched gather: each idxVec[i] has the same batch shape
-
-        // MLX doesn't have a multi-axis gather directly, but we can use
-        // sequential take_along_axis or flatten + single gather
-        // Flatten the operand and compute linear indices
-        auto flatOperand = mlx::core::flatten(operand);
-        auto linearIdx = idxVec[0];
-        // Clamp indices to valid range
-        for (size_t i = 0; i < axes.size(); ++i) {
-            auto clamped =
-                mlx::core::clip(idxVec[i], mlx::core::array(0, mlx::core::int32),
-                                mlx::core::array(operand.shape(axes[i]) - 1, mlx::core::int32));
-            idxVec[i] = clamped;
-        }
-        // Compute linear index: idx[0] * stride[0] + idx[1] * stride[1] + ...
-        linearIdx = mlx::core::array(0, mlx::core::int32);
-        for (size_t i = 0; i < axes.size(); ++i) {
-            // Compute stride for this axis
-            int stride = 1;
-            for (int d = axes[i] + 1; d < operand.ndim(); ++d) {
-                stride *= operand.shape(d);
+        // Identify which operand dims are offset dims (not collapsed)
+        std::set<int> collapsedSet(collapsedSliceDims.begin(), collapsedSliceDims.end());
+        std::vector<int> offsetOperandDims;
+        for (int d = 0; d < operand.ndim(); ++d) {
+            if (collapsedSet.count(d) == 0) {
+                offsetOperandDims.push_back(d);
             }
-            linearIdx = mlx::core::add(
-                linearIdx,
-                mlx::core::multiply(idxVec[i], mlx::core::array(stride, mlx::core::int32)));
         }
 
-        result = mlx::core::take(flatOperand, linearIdx, 0);
+        mlx::core::array result = operand;
+
+        if (offsetOperandDims.empty()) {
+            // Full-index gather: all dims collapsed, flatten and use linear indices
+            auto flatOperand = mlx::core::flatten(operand);
+            auto linearIdx = mlx::core::array(0, mlx::core::int32);
+            for (size_t i = 0; i < axes.size(); ++i) {
+                int stride = 1;
+                for (int d = axes[i] + 1; d < operand.ndim(); ++d) {
+                    stride *= operand.shape(d);
+                }
+                linearIdx = mlx::core::add(
+                    linearIdx,
+                    mlx::core::multiply(idxVec[i], mlx::core::array(stride, mlx::core::int32)));
+            }
+            result = mlx::core::take(flatOperand, linearIdx, 0);
+        } else {
+            // Partial-index gather: some dims are offset (preserved), rest are collapsed.
+            // Transpose operand to put offset dims first, collapsed dims last,
+            // flatten the collapsed dims, compute linear indices, then use take_along_axis.
+            std::vector<int> perm;
+            perm.reserve(operand.ndim());
+            for (int d : offsetOperandDims) {
+                perm.push_back(d);
+            }
+            for (int d = 0; d < operand.ndim(); ++d) {
+                if (collapsedSet.count(d) != 0) {
+                    perm.push_back(d);
+                }
+            }
+
+            bool needsPerm = false;
+            for (int i = 0; i < static_cast<int>(perm.size()); ++i) {
+                if (perm[i] != i) {
+                    needsPerm = true;
+                    break;
+                }
+            }
+            auto permuted = needsPerm ? mlx::core::transpose(operand, perm) : operand;
+
+            // Flatten collapsed dims into a single dim
+            int numOffset = static_cast<int>(offsetOperandDims.size());
+            mlx::core::Shape flatShape;
+            for (int i = 0; i < numOffset; ++i) {
+                flatShape.push_back(permuted.shape(i));
+            }
+            int flattenedSize = 1;
+            for (int i = numOffset; i < permuted.ndim(); ++i) {
+                flattenedSize *= permuted.shape(i);
+            }
+            flatShape.push_back(flattenedSize);
+            auto flatOperand = mlx::core::reshape(permuted, flatShape);
+
+            // Compute linear indices within the collapsed dims.
+            // Collapsed dims are flattened in sorted operand-dim order, so compute
+            // strides based on that order rather than startIndexMap order.
+            std::vector<int> collapsedDimsSorted(collapsedSet.begin(), collapsedSet.end());
+            std::sort(collapsedDimsSorted.begin(), collapsedDimsSorted.end());
+            std::map<int, int> strideMap;
+            int s = 1;
+            for (int i = static_cast<int>(collapsedDimsSorted.size()) - 1; i >= 0; --i) {
+                strideMap[collapsedDimsSorted[i]] = s;
+                s *= operand.shape(collapsedDimsSorted[i]);
+            }
+            auto linearIdx = mlx::core::array(0, mlx::core::int32);
+            for (size_t i = 0; i < axes.size(); ++i) {
+                linearIdx = mlx::core::add(
+                    linearIdx, mlx::core::multiply(idxVec[i], mlx::core::array(strideMap[axes[i]],
+                                                                               mlx::core::int32)));
+            }
+
+            // Expand linearIdx to have ndim == flatOperand.ndim() for take_along_axis.
+            // Prepend numOffset singleton dims (offset axes) and append any missing
+            // trailing dims so the total rank matches flatOperand exactly.
+            mlx::core::Shape expandedShape(numOffset, 1);
+            auto idxBatchShape = linearIdx.shape();
+            for (int d : idxBatchShape) {
+                expandedShape.push_back(d);
+            }
+            while (static_cast<int>(expandedShape.size()) < flatOperand.ndim()) {
+                expandedShape.push_back(1);
+            }
+            linearIdx = mlx::core::reshape(linearIdx, expandedShape);
+
+            result = mlx::core::take_along_axis(flatOperand, linearIdx, numOffset);
+        }
 
         // Reshape to expected output shape
         auto resultType = mlir::dyn_cast<mlir::RankedTensorType>(op->getResult(0).getType());
@@ -3255,6 +3326,9 @@ bool HandleScatter(mlir::Operation* op, ValueMap& values, std::vector<mlx::core:
 
         // Reshape updates: (idx_shape..., operand_shape_with_1_at_covered_dims...)
         // Covered dims = scatter dims + batch dims + inserted window dims
+        // Updates dims are split into index dims (not in update_window_dims)
+        // and window dims (in update_window_dims).
+        auto updateWindowDims = dimNumbers.getUpdateWindowDims();
         std::set<int> coveredDims;
         for (auto d : scatterDimsToOperandDims) {
             coveredDims.insert(static_cast<int>(d));
@@ -3267,17 +3341,50 @@ bool HandleScatter(mlir::Operation* op, ValueMap& values, std::vector<mlx::core:
         }
 
         auto updShape = updates.shape();
-        mlx::core::Shape newShape(updShape.begin(), updShape.end());
+        int updNdim = static_cast<int>(updShape.size());
+        std::set<int> windowDimSet(updateWindowDims.begin(), updateWindowDims.end());
+
+        // Separate index dims and window dims, transpose if needed
+        std::vector<int> transposeOrder;
+        for (int i = 0; i < updNdim; ++i) {
+            if (windowDimSet.count(i) == 0) {
+                transposeOrder.push_back(i);
+            }
+        }
+        int numIdxDims = static_cast<int>(transposeOrder.size());
+        for (int i = 0; i < updNdim; ++i) {
+            if (windowDimSet.count(i) != 0) {
+                transposeOrder.push_back(i);
+            }
+        }
+        auto transposedUpdates = updates;
+        bool needsTranspose = false;
+        for (int i = 0; i < updNdim; ++i) {
+            if (transposeOrder[i] != i) {
+                needsTranspose = true;
+                break;
+            }
+        }
+        if (needsTranspose) {
+            transposedUpdates = mlx::core::transpose(updates, transposeOrder);
+        }
+        auto tShape = transposedUpdates.shape();
+
+        // Build final shape: (idx_dims..., operand_dim_0, ...)
+        mlx::core::Shape newShape;
+        for (int i = 0; i < numIdxDims; ++i) {
+            newShape.push_back(tShape[i]);
+        }
+        int windowIdx = 0;
         for (int dim = 0; dim < static_cast<int>(operand.ndim()); ++dim) {
             if (coveredDims.count(dim) != 0) {
                 newShape.push_back(1);
             } else {
-                // Window dim — find size from update_window_dims
-                // For simplicity, get it from the expected output type
-                newShape.push_back(operand.shape(dim));
+                newShape.push_back(tShape[numIdxDims + windowIdx]);
+                ++windowIdx;
             }
         }
-        auto reshapedUpdates = mlx::core::reshape(updates, newShape);
+        auto reshapedUpdates = mlx::core::reshape(transposedUpdates, newShape);
 
         mlx::core::array result = operand;
         switch (scatterType) {
@@ -3404,12 +3511,12 @@ bool HandleScatter(mlir::Operation* op, ValueMap& values, std::vector<mlx::core:
         return true;
     }
 
-    // Multi-dimensional scatter: all dims are inserted (full index scatter)
-    if (scatterDimsToOperandDims.size() == insertedWindowDims.size() &&
-        scatterDimsToOperandDims.size() == operand.ndim()) {
-        // Full index scatter: each index selects a single element
-        // Extract per-axis indices from the index_vector_dim
+    // Multi-dimensional scatter: inserted_window_dims == scatter_dims_to_operand_dims
+    // Handles both full index scatter (all operand dims are scatter targets)
+    // and partial index scatter (some operand dims are window dims).
+    if (scatterDimsToOperandDims.size() == insertedWindowDims.size()) {
         auto indices = scatterIndices;
+        auto updateWindowDims = dimNumbers.getUpdateWindowDims();
 
         // Build per-axis index arrays
         std::vector<mlx::core::array> idxVec;
@@ -3431,14 +3538,63 @@ bool HandleScatter(mlir::Operation* op, ValueMap& values, std::vector<mlx::core:
             idxVec.push_back(axisIndices);
         }
 
-        // Updates need reshaping: add size-1 dims for all operand dims
-        auto reshapedUpdates = updates;
+        // Reshape updates for MLX: (idx_shape..., operand_dims...)
+        // where scatter target dims get size 1 and window dims keep their size.
+        //
+        // StableHLO updates dims are split into:
+        //   - index dims: all dims NOT in update_window_dims
+        //   - window dims: dims IN update_window_dims (correspond to non-inserted operand dims)
+        // These can be interleaved, so we first transpose to put index dims first.
+        std::set<int> insertedSet(insertedWindowDims.begin(), insertedWindowDims.end());
+        std::set<int> windowDimSet(updateWindowDims.begin(), updateWindowDims.end());
         auto updShape = updates.shape();
-        mlx::core::Shape newShape(updShape.begin(), updShape.end());
-        for (int i = 0; i < static_cast<int>(operand.ndim()); ++i) {
-            newShape.push_back(1);
+        int updNdim = static_cast<int>(updShape.size());
+
+        // Separate index dims and window dims in updates
+        std::vector<int> transposeOrder;
+        // Index dims first
+        for (int i = 0; i < updNdim; ++i) {
+            if (windowDimSet.count(i) == 0) {
+                transposeOrder.push_back(i);
+            }
         }
-        reshapedUpdates = mlx::core::reshape(updates, newShape);
+        int numIdxDims = static_cast<int>(transposeOrder.size());
+        // Window dims second
+        for (int i = 0; i < updNdim; ++i) {
+            if (windowDimSet.count(i) != 0) {
+                transposeOrder.push_back(i);
+            }
+        }
+
+        // Transpose if needed
+        auto transposedUpdates = updates;
+        bool needsTranspose = false;
+        for (int i = 0; i < updNdim; ++i) {
+            if (transposeOrder[i] != i) {
+                needsTranspose = true;
+                break;
+            }
+        }
+        if (needsTranspose) {
+            transposedUpdates = mlx::core::transpose(updates, transposeOrder);
+        }
+        auto tShape = transposedUpdates.shape();
+
+        // Build final shape: (idx_dims..., operand_dim_0, operand_dim_1, ...)
+        mlx::core::Shape newShape;
+        for (int i = 0; i < numIdxDims; ++i) {
+            newShape.push_back(tShape[i]);
+        }
+        int windowIdx = 0;
+        for (int operandDim = 0; operandDim < static_cast<int>(operand.ndim()); ++operandDim) {
+            if (insertedSet.count(operandDim) != 0) {
+                newShape.push_back(1);
+            } else {
+                newShape.push_back(tShape[numIdxDims + windowIdx]);
+                ++windowIdx;
+            }
+        }
+        auto reshapedUpdates = mlx::core::reshape(transposedUpdates, newShape);
 
         mlx::core::array result = operand;
         switch (scatterType) {
