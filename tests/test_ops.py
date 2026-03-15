@@ -155,6 +155,53 @@ def test_op_grad(
             jax.tree.map_with_path(assert_allclose_with_path, *results)
 
 
+def test_func_call_no_spurious_errors() -> None:
+    """Test that func.call with while loops doesn't produce spurious MPS ERROR messages.
+
+    Regression test for https://github.com/tillahoffmann/jax-mps/issues/91.
+    Nested jax.jit calls generate func.call ops in StableHLO. When the callee
+    contains stablehlo.while (from lax.scan), the mlx::core::compile() attempt
+    fails and falls back to direct execution. This should NOT produce [MPS ERROR]
+    messages on stderr.
+    """
+    if TEST_MODE == "cpu":
+        pytest.skip("MPS-specific test skipped in CPU-only mode")
+
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import jax
+import jax.numpy as jnp
+from jax import lax
+
+def inner_fn(x):
+    def scan_body(carry, elem):
+        return carry + elem, carry + elem
+    _, ys = lax.scan(scan_body, jnp.float32(0.0), x)
+    return ys
+
+fn = jax.jit(lambda x: jax.jit(inner_fn)(x).sum())
+result = fn(jnp.ones((8,)))
+result.block_until_ready()
+""",
+        ],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "JAX_PLATFORMS": "mps"},
+    )
+    assert result.returncode == 0, (
+        f"Subprocess failed with return code {result.returncode}:\n{result.stderr}"
+    )
+    assert "[MPS ERROR]" not in result.stderr, (
+        f"Spurious MPS ERROR messages in stderr:\n{result.stderr}"
+    )
+
+
 def test_unsupported_op_error_message(jit: bool) -> None:
     """Check that unsupported-op errors link to the issue template and CONTRIBUTING.md."""
     if TEST_MODE == "cpu":
