@@ -6,9 +6,42 @@ from jax import numpy as jnp
 from .util import OperationTestConfig
 
 
+def _inner_fn_with_scan(x):
+    """Simulates _preprocess from jax-baseline: uses lax.scan (→ stablehlo.while)."""
+
+    def scan_body(carry, elem):
+        return carry + elem, carry + elem
+
+    _, ys = lax.scan(scan_body, jnp.float32(0.0), x)
+    return ys
+
+
+def _func_call_with_scan(x):
+    """Calls _inner_fn_with_scan via jax.jit, generating a func.call in StableHLO."""
+    return jax.jit(_inner_fn_with_scan)(x).sum()
+
+
+@jax.checkpoint
+def _checkpointed_fn(x):
+    """Checkpointed function that generates optimization_barrier in StableHLO."""
+    return jnp.tanh(x * 2 + 1)
+
+
 def make_control_flow_op_configs():
     with OperationTestConfig.module_name("control_flow"):
         return [
+            # ==================== func.call with scan (issue #91) ====================
+            OperationTestConfig(
+                _func_call_with_scan,
+                lambda key: random.normal(key, (8,)),
+                name="func_call.scan",
+            ),
+            # ==================== jax.checkpoint / optimization_barrier (issue #91) ====================
+            OperationTestConfig(
+                lambda x: _checkpointed_fn(x).sum(),
+                lambda key: random.normal(key, (4, 4)),
+                name="checkpoint.forward",
+            ),
             # ==================== lax.cond (2-branch case) ====================
             OperationTestConfig(
                 lambda pred, x, y: lax.cond(pred, lambda: x + 1, lambda: y * 2),
