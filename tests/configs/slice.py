@@ -347,4 +347,53 @@ def make_slice_op_configs():
                 lambda key: random.normal(key, (3, 4, 5)),
                 name="partial_gather_scalar_indices",
             ),
+            # Multi-dim gather with no collapsed dims (dynamic sub-tensor slice).
+            # start_index_map=[1,2] with empty collapsed_slice_dims: extracts a
+            # [2,1,1] sub-tensor from [2,3,3] at dynamic (row, col) start position.
+            # Used by batched LU pivoting in jnp.linalg.inv.
+            OperationTestConfig(
+                lambda x: lax.gather(
+                    x,
+                    jnp.array([[1, 2]]),
+                    dimension_numbers=lax.GatherDimensionNumbers(
+                        offset_dims=(0, 1, 2),
+                        collapsed_slice_dims=(),
+                        start_index_map=(1, 2),
+                    ),
+                    slice_sizes=(2, 1, 1),
+                ),
+                lambda key: random.normal(key, (2, 3, 3)),
+                name="multi_dim_gather_no_collapse",
+            ),
+            # Batched gather with offset dims: per-batch column permutation.
+            # operand_batching_dims=[0], start_index_map=[1] with offset_dims
+            # that require proper index expansion (not just trailing 1s).
+            # Used by batched LU solve in jnp.linalg.inv.
+            OperationTestConfig(
+                lambda x, idx: jax.vmap(lambda xi, ii: xi[:, ii])(x, idx),
+                lambda key: random.normal(key, (2, 3, 4)),
+                lambda key: random.randint(key, (2, 3), 0, 4),
+                name="batched_gather_offset_dims",
+            ),
+            # Multi-dim scatter (slice_update) with no inserted window dims.
+            # Inverse of multi_dim_gather_no_collapse: updates a sub-tensor at
+            # dynamic (row, col) start position. Tests ScatterType::Update.
+            OperationTestConfig(
+                lambda x: lax.dynamic_update_slice(
+                    x,
+                    jnp.ones((2, 1, 1)),
+                    (0, 1, 2),
+                ),
+                lambda key: random.normal(key, (2, 3, 3)),
+                name="multi_dim_scatter_slice_update",
+            ),
+            # Multi-dim scatter with Add semantics: the gradient of
+            # dynamic_update_slice produces a scatter-add into a zeros tensor.
+            # This exercises the ScatterType::Add path in multi-dim slice_update.
+            OperationTestConfig(
+                lambda x, u: lax.dynamic_update_slice(x, u, (0, 1, 2)),
+                lambda key: random.normal(key, (2, 3, 3)),
+                lambda key: random.normal(key, (2, 1, 1)),
+                name="multi_dim_scatter_slice_add",
+            ),
         ]
