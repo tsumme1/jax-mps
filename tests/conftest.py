@@ -52,6 +52,8 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
         "chlo.acosh",
         "chlo.asin",
         "chlo.asinh",
+        "chlo.atan",
+        "chlo.atan2",
         "chlo.atanh",
         "chlo.bessel_i1e",
         "chlo.cosh",
@@ -62,6 +64,7 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
         "chlo.next_after",
         "chlo.sinh",
         "chlo.square",
+        "chlo.tan",
         "chlo.top_k",
         # StableHLO ops lowered to more primitive ops
         "stablehlo.broadcast",
@@ -70,7 +73,7 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
     }
 
     # Discover ops from the dispatch table in mlx_executable.cc
-    dispatch_pattern = re.compile(r'\{"((?:stablehlo|chlo)\.[^"]+)"')
+    dispatch_pattern = re.compile(r'\{"((?:stablehlo|chlo)\.[^"]+)",\s*Handle')
     executable_file = pjrt_dir / "mlx_executable.cc"
     assert executable_file.is_file()
     with executable_file.open() as fp:
@@ -88,7 +91,7 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
             terminalreporter._session.exitstatus, 1
         )
 
-    missing = op_names - exercised_ops
+    missing = op_names - exercised_ops - mlir_lowered_ops
     if missing:
         terminalreporter.section("Op coverage errors")
         terminalreporter.write_line(
