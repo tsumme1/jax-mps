@@ -93,6 +93,15 @@ std::optional<mlx::core::array> ApplyScatter(ScatterType scatterType,
                                              const mlx::core::array& updates,
                                              const std::vector<int>& axes);
 
+// --- Shared sort utilities (defined in sort_fft_complex.cc) ---
+
+// Compute top-k values and indices along the last axis using ascending argsort.
+// Returns (values, indices) where values are in descending order.
+std::pair<mlx::core::array, mlx::core::array> TopKImpl(const mlx::core::array& input, int k);
+
+// Reverse an array along a given axis using gather with reversed indices.
+mlx::core::array ReverseAxis(const mlx::core::array& a, int axis);
+
 // --- Registration functions (each defined in its own .cc file) ---
 
 void RegisterArithmeticHandlers(std::unordered_map<std::string, OpHandler>& handlers);
