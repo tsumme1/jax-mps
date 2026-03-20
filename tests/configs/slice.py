@@ -430,7 +430,7 @@ def make_slice_op_configs():
             # the scatter axis). The reshape must use the actual
             # update_window_dim positions, not sequential indexing (issue #104).
             OperationTestConfig(
-                lambda x, idx: x[:, idx].mean(),
+                lambda x, idx: (x[:, idx] * jnp.arange(1, 4, dtype=jnp.float32)).sum(),
                 lambda key: random.normal(key, (4, 8, 3)),
                 lambda key: random.randint(key, (4,), 0, 8),
                 name="gather_non_contiguous_window_dims_grad",
