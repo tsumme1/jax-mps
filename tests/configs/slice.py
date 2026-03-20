@@ -424,4 +424,15 @@ def make_slice_op_configs():
                 lambda key: random.normal(key, (3, 4)),
                 name="dynamic_update_slice_single_axis_wide",
             ),
+            # Scatter-add with non-contiguous update_window_dims.
+            # Gradient of x[:, idx] where idx is a dynamic index array
+            # produces a scatter with update_window_dims=[0,2,...] (gap at
+            # the scatter axis). The reshape must use the actual
+            # update_window_dim positions, not sequential indexing (issue #104).
+            OperationTestConfig(
+                lambda x, idx: x[:, idx].mean(),
+                lambda key: random.normal(key, (4, 8, 3)),
+                lambda key: random.randint(key, (4,), 0, 8),
+                name="gather_non_contiguous_window_dims_grad",
+            ),
         ]

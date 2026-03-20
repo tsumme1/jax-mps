@@ -3776,14 +3776,19 @@ bool HandleScatter(mlir::Operation* op, ValueMap& values, std::vector<mlx::core:
                     newShape.push_back(1);
                 }
             } else {
-                int windowIdx = static_cast<int>(updateWindowDims[0]);
+                // Map each non-inserted operand dim to the corresponding
+                // update_window_dim entry. update_window_dims may be
+                // non-contiguous (e.g. [0, 2, 3, 4] when dim 1 is the
+                // scatter/index dim in the updates tensor).
+                int winCount = 0;
                 for (int operandDim = 0; operandDim < static_cast<int>(operand.ndim());
                      ++operandDim) {
                     if (operandDim == insertedDim) {
                         newShape.push_back(1);
                     } else {
-                        newShape.push_back(updShape[windowIdx]);
-                        ++windowIdx;
+                        int updateDim = static_cast<int>(updateWindowDims[winCount]);
+                        newShape.push_back(updShape[updateDim]);
+                        ++winCount;
                     }
                 }
             }
