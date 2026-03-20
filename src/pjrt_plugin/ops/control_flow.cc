@@ -409,6 +409,26 @@ bool HandleComposite(mlir::Operation* op, ValueMap& values, std::vector<mlx::cor
         return true;
     }
 
+    // Handle chlo.top_k natively using MLX argsort
+    if (inputs.size() == 1 && op->getNumResults() == 2 && compositeName == "chlo.top_k") {
+        auto input = mlx::core::contiguous(inputs[0]);
+        auto resultType = mlir::cast<mlir::RankedTensorType>(op->getResult(0).getType());
+        int k = static_cast<int>(resultType.getShape().back());
+        int axis = static_cast<int>(input.ndim()) - 1;
+
+        auto sortedIndices = mlx::core::argsort(mlx::core::negative(input), axis);
+
+        mlx::core::Shape starts(sortedIndices.ndim(), 0);
+        mlx::core::Shape stops(sortedIndices.shape().begin(), sortedIndices.shape().end());
+        stops[axis] = k;
+        auto indices = mlx::core::slice(sortedIndices, starts, stops);
+
+        auto topValues = mlx::core::take_along_axis(input, indices, axis);
+        values.emplace(ToKey(op->getResult(0)), std::move(topValues));
+        values.emplace(ToKey(op->getResult(1)), mlx::core::astype(indices, mlx::core::int32));
+        return true;
+    }
+
     // Fallback: execute the decomposition function
     auto decompFunc = ctx.module.lookupSymbol<mlir::func::FuncOp>(decompositionName);
     if (!decompFunc) {

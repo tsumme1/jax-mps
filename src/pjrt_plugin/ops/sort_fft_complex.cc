@@ -5,6 +5,7 @@
 #include <complex>
 
 #include "pjrt_plugin/ops/handler_utils.h"
+#include "stablehlo/dialect/ChloOps.h"
 #include "stablehlo/dialect/StablehloOps.h"
 
 namespace jax_mps {
@@ -24,19 +25,75 @@ bool HandleSort(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::ar
     bool isStable = sortOp.getIsStable();
     (void)isStable;  // MLX sort is always stable
 
-    // Analyze comparator to determine sort direction
+    // Analyze comparator to determine sort direction.
+    // The comparator block has args (lhs0, rhs0, lhs1, rhs1, ...) where
+    // lhs_i/rhs_i are the pair for input i. A "normal" ascending comparator
+    // returns compare LT, %arg0, %arg1 (lhs < rhs). But optimization passes
+    // may produce compare GT, %arg1, %arg0 (rhs > lhs) which is equivalent.
+    // We check which block arguments the compare uses to handle this correctly.
     bool ascending = true;
     auto& comparator = sortOp.getComparator();
     if (!comparator.empty()) {
         auto& block = comparator.front();
-        for (auto& compOp : block.getOperations()) {
-            if (auto cmpOp = mlir::dyn_cast<mlir::stablehlo::CompareOp>(compOp)) {
-                auto dir = cmpOp.getComparisonDirection();
-                if (dir == mlir::stablehlo::ComparisonDirection::GT ||
-                    dir == mlir::stablehlo::ComparisonDirection::GE) {
-                    ascending = false;
+        // Find the compare op that feeds the return value
+        auto& returnOp = block.back();
+        mlir::stablehlo::CompareOp cmpOp = nullptr;
+        if (returnOp.getNumOperands() > 0) {
+            // Trace back from return to find the compare
+            mlir::Value result = returnOp.getOperand(0);
+            if (auto* defOp = result.getDefiningOp()) {
+                cmpOp = mlir::dyn_cast<mlir::stablehlo::CompareOp>(defOp);
+                if (!cmpOp) {
+                    // Try through select: select(eq, tiebreak, primary)
+                    if (auto selOp = mlir::dyn_cast<mlir::stablehlo::SelectOp>(defOp)) {
+                        if (auto* falseDefOp = selOp.getOnFalse().getDefiningOp()) {
+                            cmpOp = mlir::dyn_cast<mlir::stablehlo::CompareOp>(falseDefOp);
+                        }
+                        if (!cmpOp) {
+                            if (auto* trueDefOp = selOp.getOnTrue().getDefiningOp()) {
+                                cmpOp = mlir::dyn_cast<mlir::stablehlo::CompareOp>(trueDefOp);
+                            }
+                        }
+                    }
+                    // Try through or: or(primary_lt, and(eq, tiebreak))
+                    if (!cmpOp) {
+                        if (auto orOp = mlir::dyn_cast<mlir::stablehlo::OrOp>(defOp)) {
+                            if (auto* lhsDefOp = orOp.getLhs().getDefiningOp()) {
+                                cmpOp = mlir::dyn_cast<mlir::stablehlo::CompareOp>(lhsDefOp);
+                            }
+                        }
+                    }
                 }
-                break;
+            }
+        }
+        // Fallback: scan for first CompareOp in the block
+        if (!cmpOp) {
+            for (auto& compOp : block.getOperations()) {
+                if (auto found = mlir::dyn_cast<mlir::stablehlo::CompareOp>(compOp)) {
+                    cmpOp = found;
+                    break;
+                }
+            }
+        }
+        if (cmpOp) {
+            auto dir = cmpOp.getComparisonDirection();
+            bool isGtGe = (dir == mlir::stablehlo::ComparisonDirection::GT ||
+                           dir == mlir::stablehlo::ComparisonDirection::GE);
+            // Check if the compare operands are swapped relative to the canonical
+            // order (arg0=lhs, arg1=rhs). If so, the effective direction is inverted.
+            // E.g., GT(%arg1, %arg0) is equivalent to LT(%arg0, %arg1).
+            bool swapped = false;
+            if (auto lhsArg = mlir::dyn_cast<mlir::BlockArgument>(cmpOp.getLhs())) {
+                if (auto rhsArg = mlir::dyn_cast<mlir::BlockArgument>(cmpOp.getRhs())) {
+                    // Canonical: lhs uses even arg (0, 2, ...), rhs uses odd arg (1, 3, ...)
+                    // Swapped: lhs uses odd arg, rhs uses even arg
+                    swapped = (lhsArg.getArgNumber() % 2 == 1) && (rhsArg.getArgNumber() % 2 == 0);
+                }
+            }
+            if (swapped) {
+                ascending = isGtGe;  // GT(rhs, lhs) = LT(lhs, rhs) = ascending
+            } else {
+                ascending = !isGtGe;  // GT(lhs, rhs) = descending
             }
         }
     }
@@ -49,19 +106,13 @@ bool HandleSort(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::ar
             MPS_LOG_ERROR("stablehlo.sort: input not found\n");
             return false;
         }
-        auto result = mlx::core::sort(input_opt->get(), dimension);
-        if (!ascending) {
-            auto shape = result.shape();
-            int dimSize = shape[dimension];
-            mlx::core::Shape starts(result.ndim(), 0);
-            mlx::core::Shape stops(shape.begin(), shape.end());
-            mlx::core::Shape steps(result.ndim(), 1);
-            starts[dimension] = dimSize - 1;
-            stops[dimension] = -dimSize - 1;
-            steps[dimension] = -1;
-            result = mlx::core::slice(result, starts, stops, steps);
+        // Sort descending by negating, sorting ascending, then negating back.
+        if (ascending) {
+            values.emplace(ToKey(op->getResult(0)), mlx::core::sort(input_opt->get(), dimension));
+        } else {
+            auto result = mlx::core::sort(mlx::core::negative(input_opt->get()), dimension);
+            values.emplace(ToKey(op->getResult(0)), mlx::core::negative(result));
         }
-        values.emplace(ToKey(op->getResult(0)), std::move(result));
     } else {
         // Sort-by-key
         auto keys_opt = GetValue(values, sortOp.getInputs()[0]);
@@ -70,20 +121,11 @@ bool HandleSort(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::ar
             return false;
         }
 
-        auto indices = mlx::core::argsort(keys_opt->get(), dimension);
-        if (!ascending) {
-            // Reverse indices along the sort dimension instead of negating keys,
-            // which would break for unsigned integer types.
-            auto shape = indices.shape();
-            int dimSize = shape[dimension];
-            mlx::core::Shape starts(indices.ndim(), 0);
-            mlx::core::Shape stops(shape.begin(), shape.end());
-            mlx::core::Shape steps(indices.ndim(), 1);
-            starts[dimension] = dimSize - 1;
-            stops[dimension] = -dimSize - 1;
-            steps[dimension] = -1;
-            indices = mlx::core::slice(indices, starts, stops, steps);
-        }
+        // Sort descending by negating keys (argsort always sorts ascending).
+        // This avoids the reverse-via-slice approach which has issues with
+        // MLX's C++ slice API and negative stop values.
+        auto sortKeys = ascending ? keys_opt->get() : mlx::core::negative(keys_opt->get());
+        auto indices = mlx::core::argsort(sortKeys, dimension);
 
         for (size_t i = 0; i < numInputs; ++i) {
             auto input_opt = GetValue(values, sortOp.getInputs()[i]);
@@ -166,12 +208,45 @@ bool HandleComplex(mlir::Operation* op, ValueMap& values, std::vector<mlx::core:
     return true;
 }
 
+// Handler for chlo.top_k
+bool HandleChloTopK(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::array>& outputs,
+                    ExecContext& ctx) {
+    auto topKOp = mlir::dyn_cast<mlir::chlo::TopKOp>(op);
+    if (!topKOp) {
+        MPS_LOG_ERROR("chlo.top_k: failed to cast\n");
+        return false;
+    }
+
+    auto input_opt = GetValue(values, topKOp.getOperand());
+    if (!input_opt) {
+        MPS_LOG_ERROR("chlo.top_k: operand not found\n");
+        return false;
+    }
+
+    int k = static_cast<int>(topKOp.getK());
+    int axis = static_cast<int>(input_opt->get().ndim()) - 1;
+
+    auto input = mlx::core::contiguous(input_opt->get());
+    auto sortedIndices = mlx::core::argsort(mlx::core::negative(input), axis);
+
+    mlx::core::Shape starts(sortedIndices.ndim(), 0);
+    mlx::core::Shape stops(sortedIndices.shape().begin(), sortedIndices.shape().end());
+    stops[axis] = k;
+    auto indices = mlx::core::slice(sortedIndices, starts, stops);
+
+    auto topValues = mlx::core::take_along_axis(input, indices, axis);
+    values.emplace(ToKey(op->getResult(0)), std::move(topValues));
+    values.emplace(ToKey(op->getResult(1)), mlx::core::astype(indices, mlx::core::int32));
+    return true;
+}
+
 }  // namespace
 
 void RegisterSortFftComplexHandlers(std::unordered_map<std::string, OpHandler>& handlers) {
     handlers.insert({"stablehlo.sort", HandleSort});
     handlers.insert({"stablehlo.fft", HandleFft});
     handlers.insert({"stablehlo.complex", HandleComplex});
+    handlers.insert({"chlo.top_k", HandleChloTopK});
 }
 
 }  // namespace jax_mps

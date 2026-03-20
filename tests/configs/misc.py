@@ -21,9 +21,11 @@ def make_misc_op_configs():
             ),
             OperationTestConfig(
                 lambda x: x,
-                lambda key: numpy.arange(120, dtype=numpy.float32)
-                .reshape(2, 3, 4, 5)
-                .transpose(2, 0, 1, 3),
+                lambda key: (
+                    numpy.arange(120, dtype=numpy.float32)
+                    .reshape(2, 3, 4, 5)
+                    .transpose(2, 0, 1, 3)
+                ),
                 name="non-contiguous-transpose-4d",
             ),
             OperationTestConfig(
