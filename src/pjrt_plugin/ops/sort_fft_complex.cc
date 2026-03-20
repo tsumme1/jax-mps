@@ -10,8 +10,9 @@
 
 namespace jax_mps {
 
+namespace {
+
 // Reverse an array along a given axis using gather with a reversed index array.
-// Unlike slice with negative steps, this works reliably with all MLX versions.
 mlx::core::array ReverseAxisImpl(const mlx::core::array& a, int axis) {
     int dimSize = a.shape(axis);
     if (dimSize <= 1)
@@ -39,8 +40,6 @@ std::pair<mlx::core::array, mlx::core::array> TopKImplFn(const mlx::core::array&
     auto topValues = mlx::core::take_along_axis(input, indices, axis);
     return {topValues, mlx::core::astype(indices, mlx::core::int32)};
 }
-
-namespace {
 
 // Analyze a sort comparator to determine sort direction.
 // The comparator block has args (lhs0, rhs0, lhs1, rhs1, ...) where
