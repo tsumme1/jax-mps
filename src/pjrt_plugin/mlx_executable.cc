@@ -4105,6 +4105,15 @@ bool HandleScatter(mlir::Operation* op, ValueMap& values, std::vector<mlx::core:
                     std::vector<int> squeezeDims;
                     for (int d = 0; d < updateVal.ndim(); ++d) {
                         if (windowDimSet.count(d) == 0) {
+                            if (updateVal.shape(d) != 1) {
+                                MPS_LOG_ERROR(
+                                    "stablehlo.scatter: non-window dim %d has size %d (expected 1) "
+                                    "in single-update path\n",
+                                    d, updateVal.shape(d));
+                                throw std::runtime_error(
+                                    "stablehlo.scatter: non-window dim has size != 1 in "
+                                    "single-update path");
+                            }
                             squeezeDims.push_back(d);
                         }
                     }

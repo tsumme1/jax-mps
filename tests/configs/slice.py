@@ -365,9 +365,9 @@ def make_slice_op_configs():
                 lambda key: random.normal(key, (2, 3, 3)),
                 name="multi_dim_gather_no_collapse",
             ),
-            # Multi-dim gather with no collapsed dims and multiple batch positions.
-            # Same as multi_dim_gather_no_collapse but with 3 batch positions
-            # instead of 1, triggering the multi-batch code path (issue #102).
+            # Similar to multi_dim_gather_no_collapse but with 3 batch positions
+            # and offset_dims shifted to (1, 2, 3) so the leading dimension is
+            # treated as batch, triggering the multi-batch code path (issue #102).
             OperationTestConfig(
                 lambda x: lax.gather(
                     x,
