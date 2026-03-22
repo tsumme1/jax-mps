@@ -337,19 +337,10 @@ bool HandleCustomCall(mlir::Operation* op, ValueMap& values, std::vector<mlx::co
 
         auto resultType = mlir::cast<mlir::RankedTensorType>(op->getResult(0).getType());
         int k = static_cast<int>(resultType.getShape().back());
-        int axis = static_cast<int>(input_opt->get().ndim()) - 1;
-
         auto input = mlx::core::contiguous(input_opt->get());
-        auto sortedIndices = mlx::core::argsort(mlx::core::negative(input), axis);
-
-        mlx::core::Shape starts(sortedIndices.ndim(), 0);
-        mlx::core::Shape stops(sortedIndices.shape().begin(), sortedIndices.shape().end());
-        stops[axis] = k;
-        auto indices = mlx::core::slice(sortedIndices, starts, stops);
-
-        auto topValues = mlx::core::take_along_axis(input, indices, axis);
+        auto [topValues, indices] = TopKImpl(input, k);
         values.emplace(ToKey(op->getResult(0)), std::move(topValues));
-        values.emplace(ToKey(op->getResult(1)), mlx::core::astype(indices, mlx::core::int32));
+        values.emplace(ToKey(op->getResult(1)), std::move(indices));
         return true;
     }
 
@@ -406,6 +397,17 @@ bool HandleComposite(mlir::Operation* op, ValueMap& values, std::vector<mlx::cor
     // Try native MLX dispatch for known two-input CHLO composite ops
     if (inputs.size() == 2 && op->getNumResults() == 1 && compositeName == "chlo.atan2") {
         values.emplace(ToKey(op->getResult(0)), mlx::core::arctan2(inputs[0], inputs[1], {}));
+        return true;
+    }
+
+    // Handle chlo.top_k natively using shared TopKImpl
+    if (inputs.size() == 1 && op->getNumResults() == 2 && compositeName == "chlo.top_k") {
+        auto input = mlx::core::contiguous(inputs[0]);
+        auto resultType = mlir::cast<mlir::RankedTensorType>(op->getResult(0).getType());
+        int k = static_cast<int>(resultType.getShape().back());
+        auto [topValues, indices] = TopKImpl(input, k);
+        values.emplace(ToKey(op->getResult(0)), std::move(topValues));
+        values.emplace(ToKey(op->getResult(1)), std::move(indices));
         return true;
     }
 

@@ -80,8 +80,9 @@ def make_numpyro_op_configs():
                 ),
                 NumpyroDistributionTestConfig(
                     dists.StudentT,
-                    lambda key, bs=batch_shape: random.gamma(key, 5.0, bs)
-                    + 2,  # df > 2
+                    lambda key, bs=batch_shape: (
+                        random.gamma(key, 5.0, bs) + 2
+                    ),  # df > 2
                     lambda key, bs=batch_shape: random.normal(key, bs),
                     lambda key, bs=batch_shape: random.gamma(key, 5.0, bs),
                 ),

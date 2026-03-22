@@ -155,10 +155,12 @@ def make_reduction_op_configs():
             ),
             # Average pool 2D (sum pool divided by window area)
             OperationTestConfig(
-                lambda x: lax.reduce_window(
-                    x, 0.0, lax.add, (1, 2, 2, 1), (1, 2, 2, 1), "valid"
-                )
-                / 4.0,
+                lambda x: (
+                    lax.reduce_window(
+                        x, 0.0, lax.add, (1, 2, 2, 1), (1, 2, 2, 1), "valid"
+                    )
+                    / 4.0
+                ),
                 lambda key: random.normal(key, (2, 8, 8, 3)),
                 name="avgpool2d-valid",
             ),
