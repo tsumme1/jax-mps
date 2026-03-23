@@ -147,6 +147,16 @@ def initialize() -> None:
         )
     except Exception as e:
         # Handle "already registered" case - this is fine, not an error
-        if "ALREADY_EXISTS" in str(e) and "mps" in str(e).lower():
-            return
-        raise MPSPluginError(f"Failed to register MPS plugin with JAX: {e}") from e
+        if not ("ALREADY_EXISTS" in str(e) and "mps" in str(e).lower()):
+            raise MPSPluginError(f"Failed to register MPS plugin with JAX: {e}") from e
+
+    # Register fused op lowerings (SDPA, RMSNorm, RoPE, GELU).
+    from jax_plugins.mps.ops import register_fused_ops
+
+    register_fused_ops()
+
+    # Monkey-patch jax.nn.gelu and jax.nn.dot_product_attention to route
+    # through fused MPS kernels (forward and backward).
+    from jax_plugins.mps.ops import patch_jax_functions
+
+    patch_jax_functions()
