@@ -18,6 +18,13 @@ namespace jax_mps {
 
 namespace {
 
+// Convert a boolean mask to an additive attention mask (true -> 0, false -> -1e9)
+// cast to the given dtype so MLX's SDPA type check passes with float16.
+mlx::core::array BoolMaskToAdditive(const mlx::core::array& mask, mlx::core::Dtype dtype) {
+    return mlx::core::astype(
+        mlx::core::where(mask, mlx::core::array(0.0F), mlx::core::array(-1e9F)), dtype);
+}
+
 // Common helper for return-like operations (func.return, stablehlo.return)
 bool CollectReturnValues(mlir::Operation* op, ValueMap& values,
                          std::vector<mlx::core::array>& outputs, const char* opName) {
@@ -316,20 +323,21 @@ bool HandleCustomCall(mlir::Operation* op, ValueMap& values, std::vector<mlx::co
     }
 
     // Handle mps.sdpa — fused scaled dot-product attention via mlx::core::fast.
-    // Inputs: queries (B, N, T, H), keys (B, N_kv, S, H), values (B, N_kv, S, H)
+    // Inputs: queries (B, N, T, H), keys (B, N_kv, S, H), values (B, N_kv, S, H),
+    //         mask (boolean, broadcastable to (B, N, T, S))
     // backend_config: {"scale": <float>}
     if (callTargetName == "mps.sdpa") {
-        if (op->getNumOperands() != 3 || op->getNumResults() != 1) {
-            MPS_LOG_ERROR("mps.sdpa: expected 3 inputs and 1 output\n");
+        if (op->getNumOperands() != 4 || op->getNumResults() != 1) {
+            MPS_LOG_ERROR("mps.sdpa: expected 4 inputs and 1 output\n");
             return false;
         }
         auto* queries = RequireValue(values, op->getOperand(0), "mps.sdpa");
         auto* keys = RequireValue(values, op->getOperand(1), "mps.sdpa");
         auto* vals = RequireValue(values, op->getOperand(2), "mps.sdpa");
-        if (!queries || !keys || !vals)
+        auto* mask = RequireValue(values, op->getOperand(3), "mps.sdpa");
+        if (!queries || !keys || !vals || !mask)
             return false;
 
-        // Parse scale from backend_config string: {"scale": <float>}
         float scale = 1.0F;
         auto bcAttr = customCallOp.getBackendConfig();
         if (bcAttr) {
@@ -342,7 +350,9 @@ bool HandleCustomCall(mlir::Operation* op, ValueMap& values, std::vector<mlx::co
             }
         }
 
-        auto result = mlx::core::fast::scaled_dot_product_attention(*queries, *keys, *vals, scale);
+        auto additive_mask = BoolMaskToAdditive(*mask, queries->dtype());
+        auto result = mlx::core::fast::scaled_dot_product_attention(*queries, *keys, *vals, scale,
+                                                                    "", additive_mask);
         values.emplace(ToKey(op->getResult(0)), std::move(result));
         return true;
     }
@@ -410,24 +420,92 @@ bool HandleCustomCall(mlir::Operation* op, ValueMap& values, std::vector<mlx::co
         return true;
     }
 
+    // Handle mps.layer_norm — fused layer normalization via mlx::core::fast.
+    // Inputs: x, weight, bias
+    // backend_config: {"eps": <float>}
+    if (callTargetName == "mps.layer_norm") {
+        if (op->getNumOperands() != 3 || op->getNumResults() != 1) {
+            MPS_LOG_ERROR("mps.layer_norm: expected 3 inputs and 1 output\n");
+            return false;
+        }
+        auto* x = RequireValue(values, op->getOperand(0), "mps.layer_norm");
+        auto* weight = RequireValue(values, op->getOperand(1), "mps.layer_norm");
+        auto* bias = RequireValue(values, op->getOperand(2), "mps.layer_norm");
+        if (!x || !weight || !bias)
+            return false;
+
+        float eps = 1e-5F;
+        auto bcAttr = customCallOp.getBackendConfig();
+        if (bcAttr) {
+            if (auto strAttr = mlir::dyn_cast<mlir::StringAttr>(*bcAttr)) {
+                auto cfg = strAttr.getValue().str();
+                auto pos = cfg.find("\"eps\":");
+                if (pos != std::string::npos) {
+                    eps = std::stof(cfg.substr(pos + 6));
+                }
+            }
+        }
+
+        auto result = mlx::core::fast::layer_norm(*x, *weight, *bias, eps);
+        values.emplace(ToKey(op->getResult(0)), std::move(result));
+        return true;
+    }
+
+    // Handle mps.layer_norm_bwd — backward for layer norm via mlx::core::vjp.
+    // Inputs: x, weight, bias, grad_out; Outputs: dx, dweight, dbias
+    if (callTargetName == "mps.layer_norm_bwd") {
+        if (op->getNumOperands() != 4 || op->getNumResults() != 3) {
+            MPS_LOG_ERROR("mps.layer_norm_bwd: expected 4 inputs and 3 outputs\n");
+            return false;
+        }
+        auto* x = RequireValue(values, op->getOperand(0), "mps.layer_norm_bwd");
+        auto* w = RequireValue(values, op->getOperand(1), "mps.layer_norm_bwd");
+        auto* b = RequireValue(values, op->getOperand(2), "mps.layer_norm_bwd");
+        auto* g = RequireValue(values, op->getOperand(3), "mps.layer_norm_bwd");
+        if (!x || !w || !b || !g)
+            return false;
+
+        float eps = 1e-5F;
+        auto bcAttr = customCallOp.getBackendConfig();
+        if (bcAttr) {
+            if (auto strAttr = mlir::dyn_cast<mlir::StringAttr>(*bcAttr)) {
+                auto cfg = strAttr.getValue().str();
+                auto pos = cfg.find("\"eps\":");
+                if (pos != std::string::npos) {
+                    eps = std::stof(cfg.substr(pos + 6));
+                }
+            }
+        }
+
+        auto vjp_fn = [eps](const std::vector<mlx::core::array>& primals) {
+            return std::vector<mlx::core::array>{
+                mlx::core::fast::layer_norm(primals[0], primals[1], primals[2], eps)};
+        };
+        auto [fwd_out, grads] = mlx::core::vjp(vjp_fn, {*x, *w, *b}, {*g});
+        values.emplace(ToKey(op->getResult(0)), std::move(grads[0]));
+        values.emplace(ToKey(op->getResult(1)), std::move(grads[1]));
+        values.emplace(ToKey(op->getResult(2)), std::move(grads[2]));
+        return true;
+    }
+
     // Handle mps.rope — fused rotary position embeddings via mlx::core::fast.
-    // Inputs: x (..., T, D) where T is sequence length, D >= dims
+    // Inputs: x (..., T, D), offset (int32 scalar)
     // backend_config: {"dims": <int>, "traditional": <bool>, "base": <float>,
-    //                  "rope_scale": <float>, "offset": <int>}
+    //                  "rope_scale": <float>}
     if (callTargetName == "mps.rope") {
-        if (op->getNumOperands() != 1 || op->getNumResults() != 1) {
-            MPS_LOG_ERROR("mps.rope: expected 1 input and 1 output\n");
+        if (op->getNumOperands() != 2 || op->getNumResults() != 1) {
+            MPS_LOG_ERROR("mps.rope: expected 2 inputs and 1 output\n");
             return false;
         }
         auto* x = RequireValue(values, op->getOperand(0), "mps.rope");
-        if (!x)
+        auto* offsetArr = RequireValue(values, op->getOperand(1), "mps.rope");
+        if (!x || !offsetArr)
             return false;
 
         int dims = 0;
         bool traditional = false;
         float base = 10000.0F;
         float rope_scale = 1.0F;
-        int offset = 0;
         auto bcAttr = customCallOp.getBackendConfig();
         if (bcAttr) {
             if (auto strAttr = mlir::dyn_cast<mlir::StringAttr>(*bcAttr)) {
@@ -450,15 +528,13 @@ bool HandleCustomCall(mlir::Operation* op, ValueMap& values, std::vector<mlx::co
                     base = *v;
                 if (auto v = findFloat("\"rope_scale\":"))
                     rope_scale = *v;
-                if (auto v = findInt("\"offset\":"))
-                    offset = *v;
                 if (cfg.find("\"traditional\": true") != std::string::npos ||
                     cfg.find("\"traditional\":true") != std::string::npos)
                     traditional = true;
             }
         }
 
-        auto result = mlx::core::fast::rope(*x, dims, traditional, base, rope_scale, offset);
+        auto result = mlx::core::fast::rope(*x, dims, traditional, base, rope_scale, *offsetArr);
         values.emplace(ToKey(op->getResult(0)), std::move(result));
         return true;
     }
@@ -475,32 +551,35 @@ bool HandleCustomCall(mlir::Operation* op, ValueMap& values, std::vector<mlx::co
             return false;
 
         // 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+        // Cast constants to input dtype to avoid f16→f32 promotion.
+        auto dt = x->dtype();
+        auto c = [dt](float v) { return mlx::core::astype(mlx::core::array(v), dt); };
         auto x3 = mlx::core::multiply(mlx::core::multiply(*x, *x, {}), *x, {});
         auto inner = mlx::core::multiply(
-            mlx::core::array(0.7978845608F),
-            mlx::core::add(*x, mlx::core::multiply(mlx::core::array(0.044715F), x3, {}), {}), {});
+            c(0.7978845608F), mlx::core::add(*x, mlx::core::multiply(c(0.044715F), x3, {}), {}),
+            {});
         auto result = mlx::core::multiply(
-            mlx::core::array(0.5F),
-            mlx::core::multiply(
-                *x, mlx::core::add(mlx::core::array(1.0F), mlx::core::tanh(inner, {}), {}), {}),
+            c(0.5F),
+            mlx::core::multiply(*x, mlx::core::add(c(1.0F), mlx::core::tanh(inner, {}), {}), {}),
             {});
         values.emplace(ToKey(op->getResult(0)), std::move(result));
         return true;
     }
 
     // Handle mps.sdpa_bwd — backward for SDPA via mlx::core::vjp.
-    // Inputs: q, k, v, grad_out; backend_config: {"scale": <float>}
+    // Inputs: q, k, v, mask, grad_out; backend_config: {"scale": <float>}
     // Outputs: dq, dk, dv
     if (callTargetName == "mps.sdpa_bwd") {
-        if (op->getNumOperands() != 4 || op->getNumResults() != 3) {
-            MPS_LOG_ERROR("mps.sdpa_bwd: expected 4 inputs and 3 outputs\n");
+        if (op->getNumOperands() != 5 || op->getNumResults() != 3) {
+            MPS_LOG_ERROR("mps.sdpa_bwd: expected 5 inputs and 3 outputs\n");
             return false;
         }
         auto* q = RequireValue(values, op->getOperand(0), "mps.sdpa_bwd");
         auto* k = RequireValue(values, op->getOperand(1), "mps.sdpa_bwd");
         auto* v = RequireValue(values, op->getOperand(2), "mps.sdpa_bwd");
-        auto* g = RequireValue(values, op->getOperand(3), "mps.sdpa_bwd");
-        if (!q || !k || !v || !g)
+        auto* mask = RequireValue(values, op->getOperand(3), "mps.sdpa_bwd");
+        auto* g = RequireValue(values, op->getOperand(4), "mps.sdpa_bwd");
+        if (!q || !k || !v || !mask || !g)
             return false;
 
         float scale = 1.0F;
@@ -515,9 +594,10 @@ bool HandleCustomCall(mlir::Operation* op, ValueMap& values, std::vector<mlx::co
             }
         }
 
-        auto vjp_fn = [scale](const std::vector<mlx::core::array>& primals) {
+        auto additive_mask = BoolMaskToAdditive(*mask, q->dtype());
+        auto vjp_fn = [scale, &additive_mask](const std::vector<mlx::core::array>& primals) {
             return std::vector<mlx::core::array>{mlx::core::fast::scaled_dot_product_attention(
-                primals[0], primals[1], primals[2], scale)};
+                primals[0], primals[1], primals[2], scale, "", additive_mask)};
         };
         auto [fwd_out, grads] = mlx::core::vjp(vjp_fn, {*q, *k, *v}, {*g});
         values.emplace(ToKey(op->getResult(0)), std::move(grads[0]));
@@ -599,23 +679,23 @@ bool HandleCustomCall(mlir::Operation* op, ValueMap& values, std::vector<mlx::co
     }
 
     // Handle mps.rope_bwd — backward for RoPE via mlx::core::vjp.
-    // Inputs: x, grad_out; backend_config same as mps.rope
+    // Inputs: x, offset (int32 scalar), grad_out; backend_config same as mps.rope
     // Outputs: dx
     if (callTargetName == "mps.rope_bwd") {
-        if (op->getNumOperands() != 2 || op->getNumResults() != 1) {
-            MPS_LOG_ERROR("mps.rope_bwd: expected 2 inputs and 1 output\n");
+        if (op->getNumOperands() != 3 || op->getNumResults() != 1) {
+            MPS_LOG_ERROR("mps.rope_bwd: expected 3 inputs and 1 output\n");
             return false;
         }
         auto* x = RequireValue(values, op->getOperand(0), "mps.rope_bwd");
-        auto* g = RequireValue(values, op->getOperand(1), "mps.rope_bwd");
-        if (!x || !g)
+        auto* offsetArr = RequireValue(values, op->getOperand(1), "mps.rope_bwd");
+        auto* g = RequireValue(values, op->getOperand(2), "mps.rope_bwd");
+        if (!x || !offsetArr || !g)
             return false;
 
         int dims = 0;
         bool traditional = false;
         float base = 10000.0F;
         float rope_scale = 1.0F;
-        int offset = 0;
         auto bcAttr = customCallOp.getBackendConfig();
         if (bcAttr) {
             if (auto strAttr = mlir::dyn_cast<mlir::StringAttr>(*bcAttr)) {
@@ -638,8 +718,6 @@ bool HandleCustomCall(mlir::Operation* op, ValueMap& values, std::vector<mlx::co
                     base = *v;
                 if (auto v = findFloat("\"rope_scale\":"))
                     rope_scale = *v;
-                if (auto v = findInt("\"offset\":"))
-                    offset = *v;
                 if (cfg.find("\"traditional\": true") != std::string::npos ||
                     cfg.find("\"traditional\":true") != std::string::npos)
                     traditional = true;
@@ -647,9 +725,9 @@ bool HandleCustomCall(mlir::Operation* op, ValueMap& values, std::vector<mlx::co
         }
 
         auto vjp_fn = [dims, traditional, base, rope_scale,
-                       offset](const std::vector<mlx::core::array>& primals) {
+                       &offsetArr](const std::vector<mlx::core::array>& primals) {
             return std::vector<mlx::core::array>{
-                mlx::core::fast::rope(primals[0], dims, traditional, base, rope_scale, offset)};
+                mlx::core::fast::rope(primals[0], dims, traditional, base, rope_scale, *offsetArr)};
         };
         auto [fwd_out, grads] = mlx::core::vjp(vjp_fn, {*x}, {*g});
         values.emplace(ToKey(op->getResult(0)), std::move(grads[0]));
@@ -670,15 +748,15 @@ bool HandleCustomCall(mlir::Operation* op, ValueMap& values, std::vector<mlx::co
 
         auto vjp_fn = [](const std::vector<mlx::core::array>& primals) {
             const auto& x = primals[0];
+            auto dt = x.dtype();
+            auto c = [dt](float v) { return mlx::core::astype(mlx::core::array(v), dt); };
             auto x3 = mlx::core::multiply(mlx::core::multiply(x, x, {}), x, {});
             auto inner = mlx::core::multiply(
-                mlx::core::array(0.7978845608F),
-                mlx::core::add(x, mlx::core::multiply(mlx::core::array(0.044715F), x3, {}), {}),
+                c(0.7978845608F), mlx::core::add(x, mlx::core::multiply(c(0.044715F), x3, {}), {}),
                 {});
             return std::vector<mlx::core::array>{mlx::core::multiply(
-                mlx::core::array(0.5F),
-                mlx::core::multiply(
-                    x, mlx::core::add(mlx::core::array(1.0F), mlx::core::tanh(inner, {}), {}), {}),
+                c(0.5F),
+                mlx::core::multiply(x, mlx::core::add(c(1.0F), mlx::core::tanh(inner, {}), {}), {}),
                 {})};
         };
         auto [fwd_out, grads] = mlx::core::vjp(vjp_fn, {*x}, {*g});
