@@ -1,0 +1,277 @@
+"""Gemma 3 text transformer architecture in Flax NNX."""
+
+import dataclasses
+
+import jax
+import jax.numpy as jnp
+from flax import nnx
+
+from jax_plugins.mps.ops import rms_norm, rope
+
+
+@dataclasses.dataclass
+class Gemma3Config:
+    vocab_size: int
+    num_hidden_layers: int
+    hidden_size: int
+    intermediate_size: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    head_dim: int
+    query_pre_attn_scalar: float = 256.0
+    rope_theta: float = 1_000_000.0
+    rope_local_base_freq: float = 10_000.0
+    rms_norm_eps: float = 1e-6
+    sliding_window: int = 1024
+    sliding_window_pattern: int = 6
+    dtype: jnp.dtype = jnp.float32
+
+
+KVCache = list[tuple[jax.Array, jax.Array]]
+
+
+class RMSNorm(nnx.Module):
+    def __init__(self, dim, eps=1e-6):
+        self.weight = nnx.Param(jnp.zeros(dim))
+        self.eps = eps
+
+    def __call__(self, x):
+        w = self.weight[...]
+        return rms_norm(x, jnp.ones_like(w) + w, eps=self.eps)
+
+
+class Gemma3Attention(nnx.Module):
+    def __init__(self, config, layer_idx, *, rngs):
+        self.num_heads = config.num_attention_heads
+        self.num_kv_heads = config.num_key_value_heads
+        self.head_dim = config.head_dim
+        self.scale = config.query_pre_attn_scalar**-0.5
+        self.layer_idx = layer_idx
+        self.is_sliding = (layer_idx + 1) % config.sliding_window_pattern != 0
+        self.sliding_window = config.sliding_window
+
+        # Different RoPE base for sliding vs global layers.
+        if self.is_sliding:
+            self.rope_theta = config.rope_local_base_freq
+        else:
+            self.rope_theta = config.rope_theta
+
+        dt = config.dtype
+        self.q_proj = nnx.Linear(
+            config.hidden_size,
+            self.num_heads * self.head_dim,
+            use_bias=False,
+            dtype=dt,
+            rngs=rngs,
+        )
+        self.k_proj = nnx.Linear(
+            config.hidden_size,
+            self.num_kv_heads * self.head_dim,
+            use_bias=False,
+            dtype=dt,
+            rngs=rngs,
+        )
+        self.v_proj = nnx.Linear(
+            config.hidden_size,
+            self.num_kv_heads * self.head_dim,
+            use_bias=False,
+            dtype=dt,
+            rngs=rngs,
+        )
+        self.o_proj = nnx.Linear(
+            self.num_heads * self.head_dim,
+            config.hidden_size,
+            use_bias=False,
+            dtype=dt,
+            rngs=rngs,
+        )
+
+        # QK norms (new in Gemma 3).
+        self.q_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
+
+    def __call__(self, x, pos_offset, kv_cache=None, cache_index=None):
+        B, T, _ = x.shape
+        q = (
+            self.q_proj(x)
+            .reshape(B, T, self.num_heads, self.head_dim)
+            .transpose(0, 2, 1, 3)
+        )
+        k = (
+            self.k_proj(x)
+            .reshape(B, T, self.num_kv_heads, self.head_dim)
+            .transpose(0, 2, 1, 3)
+        )
+        v = (
+            self.v_proj(x)
+            .reshape(B, T, self.num_kv_heads, self.head_dim)
+            .transpose(0, 2, 1, 3)
+        )
+
+        # QK norms before RoPE.
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        q = rope(q, dims=self.head_dim, base=self.rope_theta, offset=pos_offset)
+        k = rope(k, dims=self.head_dim, base=self.rope_theta, offset=pos_offset)
+
+        mask = None
+        if kv_cache is not None:
+            if cache_index is not None:
+                S = kv_cache[0].shape[2]
+                if self.is_sliding and S == self.sliding_window:
+                    # Rotating cache: write at cache_index % window_size.
+                    write_idx = cache_index % self.sliding_window
+                    k_cache = jax.lax.dynamic_update_slice(
+                        kv_cache[0], k, (0, 0, write_idx, 0)
+                    )
+                    v_cache = jax.lax.dynamic_update_slice(
+                        kv_cache[1], v, (0, 0, write_idx, 0)
+                    )
+                    new_kv = (k_cache, v_cache)
+                    k = k_cache
+                    v = v_cache
+                    # Mask out unfilled slots in early steps.
+                    valid_len = jnp.minimum(cache_index + T, self.sliding_window)
+                    mask = (jnp.arange(S)[None, :] < valid_len)[:, None, None, :]
+                else:
+                    # Full cache: write at cache_index.
+                    k_cache = jax.lax.dynamic_update_slice(
+                        kv_cache[0], k, (0, 0, cache_index, 0)
+                    )
+                    v_cache = jax.lax.dynamic_update_slice(
+                        kv_cache[1], v, (0, 0, cache_index, 0)
+                    )
+                    new_kv = (k_cache, v_cache)
+                    k = k_cache
+                    v = v_cache
+                    valid_len = cache_index + T
+                    mask = (jnp.arange(S)[None, :] < valid_len)[:, None, None, :]
+            else:
+                k = jnp.concatenate([kv_cache[0], k], axis=2)
+                v = jnp.concatenate([kv_cache[1], v], axis=2)
+                if self.is_sliding:
+                    S = k.shape[2]
+                    if S > self.sliding_window:
+                        k = k[:, :, S - self.sliding_window :, :]
+                        v = v[:, :, S - self.sliding_window :, :]
+                new_kv = (k, v)
+        else:
+            new_kv = (k, v)
+
+        # Sliding window causal mask for prefill (no cache).
+        if mask is None and kv_cache is None and self.is_sliding and T > 1:
+            row = jnp.arange(T)[:, None]
+            col = jnp.arange(T)[None, :]
+            mask = (row >= col) & (row - col < self.sliding_window)
+            mask = mask[None, :, None, :]  # (1, T, 1, T) — BTNH layout
+
+        # Back to (B, T, N, H) for jax.nn.dot_product_attention.
+        q = q.transpose(0, 2, 1, 3)
+        k = k.transpose(0, 2, 1, 3)
+        v = v.transpose(0, 2, 1, 3)
+        if mask is not None:
+            out = jax.nn.dot_product_attention(q, k, v, mask=mask, scale=self.scale)
+        elif kv_cache is None:
+            out = jax.nn.dot_product_attention(
+                q, k, v, is_causal=True, scale=self.scale
+            )
+        else:
+            out = jax.nn.dot_product_attention(q, k, v, scale=self.scale)
+        return self.o_proj(out.reshape(B, T, -1)), new_kv
+
+
+class Gemma3MLP(nnx.Module):
+    def __init__(self, config, *, rngs):
+        dt = config.dtype
+        # Fused gate+up projection.
+        self.gate_up_proj = nnx.Linear(
+            config.hidden_size,
+            2 * config.intermediate_size,
+            use_bias=False,
+            dtype=dt,
+            rngs=rngs,
+        )
+        self.down_proj = nnx.Linear(
+            config.intermediate_size,
+            config.hidden_size,
+            use_bias=False,
+            dtype=dt,
+            rngs=rngs,
+        )
+
+    def __call__(self, x):
+        gate_up = self.gate_up_proj(x)
+        gate, up = jnp.split(gate_up, 2, axis=-1)
+        return self.down_proj(jax.nn.gelu(gate, approximate=True) * up)
+
+
+def _clip_residual(x, y):
+    """Add residual with float16 overflow protection.
+
+    Gemma 3's large norm weights (up to ~300x) amplify hidden states beyond
+    float16 range, causing inf. Computing the addition in float32 and clipping
+    to float16 max prevents inf propagation. The resulting values (up to 65504)
+    can still cause x^2 overflow in RMSNorm. On Apple Silicon with the MPS
+    fused ``rms_norm`` op, variance is computed in float32 internally, which
+    handles this. On other backends (e.g., CPU), use float32 or bfloat16.
+    """
+    if x.dtype != jnp.float16:
+        return x + y
+    bound = jnp.finfo(jnp.float16).max
+    return jnp.clip(
+        x.astype(jnp.float32) + y.astype(jnp.float32), -bound, bound
+    ).astype(jnp.float16)
+
+
+class Gemma3DecoderLayer(nnx.Module):
+    def __init__(self, config, layer_idx, *, rngs):
+        self.self_attn = Gemma3Attention(config, layer_idx, rngs=rngs)
+        self.mlp = Gemma3MLP(config, rngs=rngs)
+        self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.pre_feedforward_layernorm = RMSNorm(
+            config.hidden_size, config.rms_norm_eps
+        )
+        self.post_feedforward_layernorm = RMSNorm(
+            config.hidden_size, config.rms_norm_eps
+        )
+
+    def __call__(self, x, pos_offset, kv_cache=None, cache_index=None):
+        attn_out, new_kv = self.self_attn(
+            self.input_layernorm(x), pos_offset, kv_cache, cache_index
+        )
+        x = _clip_residual(x, self.post_attention_layernorm(attn_out))
+        x = _clip_residual(
+            x,
+            self.post_feedforward_layernorm(
+                self.mlp(self.pre_feedforward_layernorm(x))
+            ),
+        )
+        return x, new_kv
+
+
+class Gemma3(nnx.Module):
+    def __init__(self, config, *, rngs):
+        self.config = config
+        self.embed_tokens = nnx.Embed(
+            config.vocab_size, config.hidden_size, dtype=config.dtype, rngs=rngs
+        )
+        self.layers = nnx.List(
+            Gemma3DecoderLayer(config, layer_idx=i, rngs=rngs)
+            for i in range(config.num_hidden_layers)
+        )
+        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+
+    def __call__(self, input_ids, kv_cache=None, pos_offset=0, cache_index=None):
+        x = self.embed_tokens(input_ids)
+        x = x * jnp.sqrt(jnp.array(self.config.hidden_size, dtype=x.dtype))
+        new_kv_cache: KVCache = []
+        for i, layer in enumerate(self.layers):
+            x, new_kv = layer(
+                x, pos_offset, kv_cache[i] if kv_cache else None, cache_index
+            )
+            new_kv_cache.append(new_kv)
+        x = self.norm(x)
+        # Tied embeddings — reuse embedding matrix as logit projection.
+        return x @ self.embed_tokens.embedding[...].T, new_kv_cache
