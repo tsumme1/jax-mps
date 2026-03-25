@@ -150,4 +150,20 @@ def make_misc_op_configs():
                 lambda key: random.normal(key, (10, 10)),
                 name="dense_bool_constant_tril_mask",
             ),
+            # reduce_precision: truncate mantissa/exponent bits
+            OperationTestConfig(
+                lambda x: lax.reduce_precision(x, exponent_bits=5, mantissa_bits=10),
+                lambda key: random.normal(key, (16,)),
+                name="reduce_precision",
+            ),
+            # reduce_precision with edge values (NaN, inf, zero, subnormals)
+            OperationTestConfig(
+                lambda x: lax.reduce_precision(x, exponent_bits=3, mantissa_bits=5),
+                numpy.asarray(
+                    [0.0, -0.0, jnp.inf, -jnp.inf, jnp.nan, 1e-38, -1e-38, 1.0, -1.0],
+                    dtype=numpy.float32,
+                ),
+                differentiable_argnums=(),
+                name="reduce_precision-edge",
+            ),
         ]
