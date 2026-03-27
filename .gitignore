@@ -4,6 +4,7 @@ __pycache__/
 !.claude/commands/
 .DS_Store
 .env
+.hypothesis/
 .venv/
 .vscode/
 *.egg-info
@@ -14,4 +15,3 @@ dist/
 playground/
 tickets/
 wheels/
-
