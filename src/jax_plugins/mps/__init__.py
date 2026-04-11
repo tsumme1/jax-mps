@@ -150,13 +150,21 @@ def initialize() -> None:
         if not ("ALREADY_EXISTS" in str(e) and "mps" in str(e).lower()):
             raise MPSPluginError(f"Failed to register MPS plugin with JAX: {e}") from e
 
-    # Register fused op lowerings (SDPA, RMSNorm, RoPE, GELU).
-    from jax_plugins.mps.ops import register_fused_ops
+    # --- Fused ops and monkey-patching (can be disabled via env vars) ---
+    # JAX_MPS_DISABLE_FUSED=1  → skip fused op registration AND patching
+    # JAX_MPS_DISABLE_PATCHES=1 → register fused ops but skip monkey-patching
+    disable_fused = os.environ.get("JAX_MPS_DISABLE_FUSED", "").strip() in ("1", "true", "yes")
+    disable_patches = os.environ.get("JAX_MPS_DISABLE_PATCHES", "").strip() in ("1", "true", "yes")
 
-    register_fused_ops()
+    if not disable_fused:
+        # Register fused op lowerings (SDPA, RMSNorm, RoPE, GELU).
+        from jax_plugins.mps.ops import register_fused_ops
 
-    # Monkey-patch jax.nn.gelu and jax.nn.dot_product_attention to route
-    # through fused MPS kernels (forward and backward).
-    from jax_plugins.mps.ops import patch_jax_functions
+        register_fused_ops()
 
-    patch_jax_functions()
+        if not disable_patches:
+            # Monkey-patch jax.nn.gelu and jax.nn.dot_product_attention to route
+            # through fused MPS kernels (forward and backward).
+            from jax_plugins.mps.ops import patch_jax_functions
+
+            patch_jax_functions()
