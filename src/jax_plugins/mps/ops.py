@@ -14,7 +14,7 @@ decompose to standard JAX ops.
 import jax
 import jax.numpy as jnp
 from jax._src import core
-from jax._src.interpreters import mlir
+from jax._src.interpreters import batching, mlir
 from jax._src.lax import linalg as lax_linalg
 
 # ---------------------------------------------------------------------------
@@ -336,6 +336,157 @@ def _layer_norm_bwd_lowering(ctx, x, w, b, g, *, eps):
     ).results
 
 
+# ---------------------------------------------------------------------------
+# Batching rules (required for jax.vmap over custom primitives)
+# ---------------------------------------------------------------------------
+# Each rule moves the vmap batch axis to position 0 for every batched operand
+# and calls the primitive directly.  All fused ops operate on trailing
+# dimensions and are agnostic to leading batch dimensions.
+
+
+def _move_batch(x, bdim):
+    """Move batch dim to 0 if present, otherwise return unchanged."""
+    if bdim is batching.not_mapped:
+        return x
+    return jnp.moveaxis(x, bdim, 0)
+
+
+# --- SDPA ---
+
+def _sdpa_batching(args, dims, *, scale):
+    """Batching rule for mps.sdpa."""
+    q, k, v, mask = (_move_batch(a, d) for a, d in zip(args, dims))
+    return _sdpa_p.bind(q, k, v, mask, scale=scale), 0
+
+
+def _sdpa_bwd_batching(args, dims, *, scale):
+    """Batching rule for mps.sdpa_bwd."""
+    q, k, v, mask, g = (_move_batch(a, d) for a, d in zip(args, dims))
+    dq, dk, dv = _sdpa_bwd_p.bind(q, k, v, mask, g, scale=scale)
+    return (dq, dk, dv), (0, 0, 0)
+
+
+def _sdpa_causal_batching(args, dims, *, scale):
+    """Batching rule for mps.sdpa_causal."""
+    q, k, v = (_move_batch(a, d) for a, d in zip(args, dims))
+    return _sdpa_causal_p.bind(q, k, v, scale=scale), 0
+
+
+def _sdpa_causal_bwd_batching(args, dims, *, scale):
+    """Batching rule for mps.sdpa_causal_bwd."""
+    q, k, v, g = (_move_batch(a, d) for a, d in zip(args, dims))
+    dq, dk, dv = _sdpa_causal_bwd_p.bind(q, k, v, g, scale=scale)
+    return (dq, dk, dv), (0, 0, 0)
+
+
+# --- RMS Norm ---
+
+def _rms_norm_batching(args, dims, *, eps):
+    """Batching rule for mps.rms_norm.
+
+    Falls back to pure-JAX impl when weight is batched (MLX requires 1D weight).
+    """
+    bx, bw = dims
+    x, weight = (_move_batch(a, d) for a, d in zip(args, dims))
+    if bw is not batching.not_mapped:
+        return _rms_norm_impl(x, _expand_param(weight, x.ndim), eps=eps), 0
+    return _rms_norm_p.bind(x, weight, eps=eps), 0
+
+
+def _expand_param(param, x_ndim):
+    """Expand a batched parameter for broadcasting with a batched input.
+
+    When vmap batches both x and a parameter (weight/bias), after moveaxis
+    x has shape (V, ..., C) and param has shape (V, C). The impl multiplies
+    x * param, which right-aligns and clashes on interior dims. This reshapes
+    param to (V, 1, ..., 1, C) so broadcasting works correctly.
+    """
+    n_expand = x_ndim - param.ndim
+    if n_expand > 0:
+        shape = param.shape[:1] + (1,) * n_expand + param.shape[1:]
+        return param.reshape(shape)
+    return param
+
+
+def _rms_norm_bwd_batching(args, dims, *, eps):
+    """Batching rule for mps.rms_norm_bwd."""
+    bx, bw, bg = dims
+    x, w, g = (_move_batch(a, d) for a, d in zip(args, dims))
+    if bw is not batching.not_mapped:
+        w_exp = _expand_param(w, x.ndim)
+        result = jax.vjp(
+            lambda x, w: _rms_norm_impl(x, _expand_param(w, x.ndim), eps=eps),
+            x, w,
+        )[1](g)
+        return result, (0, 0)
+    dx, dw = _rms_norm_bwd_p.bind(x, w, g, eps=eps)
+    return (dx, dw), (0, 0)
+
+
+# --- Layer Norm ---
+
+def _layer_norm_batching(args, dims, *, eps):
+    """Batching rule for mps.layer_norm.
+
+    Falls back to pure-JAX impl when weight or bias is batched
+    (MLX requires 1D weight/bias). Expands batched params for
+    correct broadcasting with multi-dim x.
+    """
+    bx, bw, bb = dims
+    x, weight, bias = (_move_batch(a, d) for a, d in zip(args, dims))
+    if bw is not batching.not_mapped or bb is not batching.not_mapped:
+        if bw is not batching.not_mapped:
+            weight = _expand_param(weight, x.ndim)
+        if bb is not batching.not_mapped:
+            bias = _expand_param(bias, x.ndim)
+        return _layer_norm_impl(x, weight, bias, eps=eps), 0
+    return _layer_norm_p.bind(x, weight, bias, eps=eps), 0
+
+
+def _layer_norm_bwd_batching(args, dims, *, eps):
+    """Batching rule for mps.layer_norm_bwd."""
+    bx, bw, bb, bg = dims
+    x, w, b, g = (_move_batch(a, d) for a, d in zip(args, dims))
+    if bw is not batching.not_mapped or bb is not batching.not_mapped:
+        def _ln_expanded(x, w, b):
+            w_e = _expand_param(w, x.ndim) if w.ndim < x.ndim else w
+            b_e = _expand_param(b, x.ndim) if b.ndim < x.ndim else b
+            return _layer_norm_impl(x, w_e, b_e, eps=eps)
+        result = jax.vjp(_ln_expanded, x, w, b)[1](g)
+        return result, (0, 0, 0)
+    dx, dw, db = _layer_norm_bwd_p.bind(x, w, b, g, eps=eps)
+    return (dx, dw, db), (0, 0, 0)
+
+
+# --- RoPE ---
+
+def _rope_batching(args, batch_dims, **params):
+    """Batching rule for mps.rope."""
+    x, offset = (_move_batch(a, d) for a, d in zip(args, batch_dims))
+    return _rope_p.bind(x, offset, **params), 0
+
+
+def _rope_bwd_batching(args, batch_dims, **params):
+    """Batching rule for mps.rope_bwd."""
+    x, offset, g = (_move_batch(a, d) for a, d in zip(args, batch_dims))
+    return _rope_bwd_p.bind(x, offset, g, **params), 0
+
+
+# --- GELU ---
+
+def _gelu_batching(args, dims):
+    """Batching rule for mps.gelu (elementwise)."""
+    (x,) = args
+    (bx,) = dims
+    return _gelu_p.bind(_move_batch(x, bx)), 0
+
+
+def _gelu_bwd_batching(args, dims):
+    """Batching rule for mps.gelu_bwd (elementwise)."""
+    x, g = (_move_batch(a, d) for a, d in zip(args, dims))
+    return _gelu_bwd_p.bind(x, g), 0
+
+
 def layer_norm(x, weight, bias, *, eps=1e-5):
     """Layer normalization using fused MLX kernel on MPS."""
     eps = float(eps)
@@ -638,7 +789,21 @@ def _svd_lowering(
 
 
 def register_fused_ops():
-    """Register MLIR lowerings for all fused ops on the MPS platform."""
+    """Register MLIR lowerings and batching rules for all fused ops."""
+    # --- Batching rules (required for jax.vmap over custom primitives) ---
+    batching.primitive_batchers[_sdpa_p] = _sdpa_batching
+    batching.primitive_batchers[_sdpa_bwd_p] = _sdpa_bwd_batching
+    batching.primitive_batchers[_sdpa_causal_p] = _sdpa_causal_batching
+    batching.primitive_batchers[_sdpa_causal_bwd_p] = _sdpa_causal_bwd_batching
+    batching.primitive_batchers[_rms_norm_p] = _rms_norm_batching
+    batching.primitive_batchers[_rms_norm_bwd_p] = _rms_norm_bwd_batching
+    batching.primitive_batchers[_layer_norm_p] = _layer_norm_batching
+    batching.primitive_batchers[_layer_norm_bwd_p] = _layer_norm_bwd_batching
+    batching.primitive_batchers[_rope_p] = _rope_batching
+    batching.primitive_batchers[_rope_bwd_p] = _rope_bwd_batching
+    batching.primitive_batchers[_gelu_p] = _gelu_batching
+    batching.primitive_batchers[_gelu_bwd_p] = _gelu_bwd_batching
+
     mlir.register_lowering(_sdpa_p, _sdpa_lowering, platform="mps")
     mlir.register_lowering(_sdpa_causal_p, _sdpa_causal_lowering, platform="mps")
     mlir.register_lowering(_rms_norm_p, _rms_norm_lowering, platform="mps")
