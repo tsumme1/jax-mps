@@ -459,4 +459,16 @@ def make_control_flow_op_configs():
                 lambda key: key,
                 name="lax.fori_loop.rng_scatter",
             ),
+            # While-loop eval regression: scan with many iterations.
+            # Without eval() at each while iteration, the MLX computation
+            # graph grows unboundedly, causing wrong results or OOM.
+            OperationTestConfig(
+                lambda x: lax.scan(
+                    lambda carry, _: (carry + 0.01, carry),
+                    x,
+                    jnp.arange(50),
+                )[1].sum(),
+                lambda key: random.normal(key, (8,)),
+                name="lax.scan.accumulate_50iter",
+            ),
         ]
