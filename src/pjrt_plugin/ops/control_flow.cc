@@ -11,6 +11,7 @@
 #include <cstring>
 #include <optional>
 #include <string>
+#include <unordered_set>
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "pjrt_plugin/ops/handler_utils.h"
@@ -51,6 +52,37 @@ bool HandleStablehloReturn(mlir::Operation* op, ValueMap& values,
     return CollectReturnValues(op, values, outputs, "stablehlo.return");
 }
 
+// Collect arrays referenced inside a region but defined outside it.
+// These must be passed as explicit inputs to mx::compile to avoid
+// the "uncaptured inputs" error.
+void CollectExternalValues(mlir::Region& region, const ValueMap& values,
+                           std::vector<void*>& keys,
+                           std::vector<mlx::core::array>& arrays) {
+    std::unordered_set<void*> blockArgKeys;
+    for (auto arg : region.front().getArguments()) {
+        blockArgKeys.insert(ToKey(arg));
+    }
+
+    std::unordered_set<void*> seen;
+    for (auto& op : region.front().getOperations()) {
+        for (auto operand : op.getOperands()) {
+            auto key = ToKey(operand);
+            if (blockArgKeys.count(key) || seen.count(key))
+                continue;
+            // Check if this value is defined inside the region (by a prior op)
+            if (operand.getDefiningOp() &&
+                operand.getDefiningOp()->getParentRegion() == &region)
+                continue;
+            auto it = values.find(key);
+            if (it != values.end()) {
+                seen.insert(key);
+                keys.push_back(key);
+                arrays.push_back(it->second);
+            }
+        }
+    }
+}
+
 // Handler for stablehlo.while
 bool HandleWhile(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::array>& outputs,
                  ExecContext& ctx) {
@@ -73,104 +105,209 @@ bool HandleWhile(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::a
     auto& condRegion = whileOp.getCond();
     auto& bodyRegion = whileOp.getBody();
 
-    using CompiledFn =
-        std::function<std::vector<mlx::core::array>(const std::vector<mlx::core::array>&)>;
-    CompiledFn compiledCond;
-    CompiledFn compiledBody;
-    bool useCompiled = false;
-    try {
-        compiledCond = mlx::core::compile(
-            [&condRegion, &ctx, &values](
-                const std::vector<mlx::core::array>& inputs) -> std::vector<mlx::core::array> {
-                auto args = inputs;
-                std::vector<mlx::core::array> results;
-                ExecContext compileCtx;
-                compileCtx.module = ctx.module;
-                compileCtx.inside_compile = true;
-                if (!ExecuteRegion(condRegion, args, results, compileCtx, &values)) {
-                    return {};
-                }
-                return results;
-            });
-
-        compiledBody = mlx::core::compile(
-            [&bodyRegion, &ctx, &values](
-                const std::vector<mlx::core::array>& inputs) -> std::vector<mlx::core::array> {
-                auto args = inputs;
-                std::vector<mlx::core::array> results;
-                ExecContext compileCtx;
-                compileCtx.module = ctx.module;
-                compileCtx.inside_compile = true;
-                if (!ExecuteRegion(bodyRegion, args, results, compileCtx, &values)) {
-                    return {};
-                }
-                return results;
-            });
-
-        // Probe: run compiled cond+body once to verify they work
-        auto testCond = compiledCond(loopVars);
-        if (testCond.size() == 1) {
-            auto testBody = compiledBody(loopVars);
-            if (testBody.size() == loopVars.size()) {
-                std::vector<mlx::core::array> toEval;
-                toEval.insert(toEval.end(), testCond.begin(), testCond.end());
-                toEval.insert(toEval.end(), testBody.begin(), testBody.end());
-                mlx::core::eval(toEval);
-                useCompiled = true;
+    // --- Counted-loop detection ---
+    // Scan-produced while loops always have cond: compare(LT, arg[k], const N).
+    // After MLIR inlining/canonicalization, the constant may be folded.
+    // Detect this pattern to use a for loop (no cond eval, no item<bool>()).
+    int64_t tripCount = -1;
+    size_t counterIdx = 0;
+    {
+        auto& condBlock = condRegion.front();
+        // Find the compare op in the cond block.
+        mlir::Operation* cmpOp = nullptr;
+        for (auto& op : condBlock.getOperations()) {
+            if (op.getName().getStringRef() == "stablehlo.compare") {
+                cmpOp = &op;
+                break;
             }
         }
+        if (cmpOp) {
+            auto cmpDir = cmpOp->getAttrOfType<mlir::stablehlo::ComparisonDirectionAttr>(
+                "comparison_direction");
+            if (cmpDir && cmpDir.getValue() == mlir::stablehlo::ComparisonDirection::LT) {
+                auto lhs = cmpOp->getOperand(0);
+                auto rhs = cmpOp->getOperand(1);
+
+                // Helper: try to extract a constant integer from an MLIR value.
+                auto tryGetConstant = [&](mlir::Value val) -> std::optional<int64_t> {
+                    if (auto* defOp = val.getDefiningOp()) {
+                        if (defOp->getName().getStringRef() == "stablehlo.constant") {
+                            auto attr = defOp->getAttrOfType<mlir::DenseElementsAttr>("value");
+                            if (attr && attr.isSplat())
+                                return attr.getSplatValue<mlir::APInt>().getSExtValue();
+                        }
+                    }
+                    // Check if the value is in the parent scope's ValueMap (already evaluated)
+                    auto it = values.find(ToKey(val));
+                    if (it != values.end()) {
+                        auto& arr = it->second;
+                        if (arr.dtype() == mlx::core::int32 && arr.size() == 1) {
+                            mlx::core::eval(arr);
+                            return static_cast<int64_t>(arr.item<int32_t>());
+                        }
+                    }
+                    return std::nullopt;
+                };
+
+                // Check: lhs=blockArg (counter), rhs=constant (trip count)
+                auto rhsConst = tryGetConstant(rhs);
+                if (rhsConst) {
+                    for (size_t i = 0; i < condBlock.getNumArguments(); ++i) {
+                        if (lhs == condBlock.getArgument(i)) {
+                            counterIdx = i;
+                            tripCount = *rhsConst;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Collect external values referenced by body (and cond for fallback).
+    std::vector<void*> allExtKeys;
+    std::vector<mlx::core::array> allExtArrays;
+    {
+        std::unordered_set<void*> seen;
+        auto collect = [&](mlir::Region& region) {
+            std::unordered_set<void*> blockArgKeys;
+            for (auto arg : region.front().getArguments())
+                blockArgKeys.insert(ToKey(arg));
+            for (auto& op : region.front().getOperations()) {
+                for (auto operand : op.getOperands()) {
+                    auto key = ToKey(operand);
+                    if (blockArgKeys.count(key) || seen.count(key))
+                        continue;
+                    if (operand.getDefiningOp() &&
+                        operand.getDefiningOp()->getParentRegion() == &region)
+                        continue;
+                    auto it = values.find(key);
+                    if (it != values.end()) {
+                        seen.insert(key);
+                        allExtKeys.push_back(key);
+                        allExtArrays.push_back(it->second);
+                    }
+                }
+            }
+        };
+        collect(bodyRegion);
+        if (tripCount < 0) collect(condRegion);  // only needed for fallback
+    }
+
+    const size_t nLoopVars = loopVars.size();
+    const size_t nExt = allExtKeys.size();
+
+    using CompiledFn =
+        std::function<std::vector<mlx::core::array>(const std::vector<mlx::core::array>&)>;
+    CompiledFn compiledBody;
+    bool useCompiled = false;
+
+    try {
+        compiledBody = mlx::core::compile(
+            [&bodyRegion, &ctx, &allExtKeys, nLoopVars, nExt](
+                const std::vector<mlx::core::array>& inputs) -> std::vector<mlx::core::array> {
+                auto args = std::vector<mlx::core::array>(inputs.begin(),
+                                                          inputs.begin() + nLoopVars);
+                ValueMap parentVals;
+                for (size_t i = 0; i < nExt; ++i)
+                    parentVals.emplace(allExtKeys[i], inputs[nLoopVars + i]);
+                std::vector<mlx::core::array> results;
+                ExecContext compileCtx;
+                compileCtx.module = ctx.module;
+                compileCtx.inside_compile = true;
+                if (!ExecuteRegion(bodyRegion, args, results, compileCtx, &parentVals))
+                    return {};
+                return results;
+            });
+
+        // Probe: verify compiled body works.
+        std::vector<mlx::core::array> probeInputs = loopVars;
+        probeInputs.insert(probeInputs.end(), allExtArrays.begin(), allExtArrays.end());
+        auto testBody = compiledBody(probeInputs);
+        if (testBody.size() == nLoopVars) {
+            mlx::core::eval(testBody);
+            useCompiled = true;
+        }
+    } catch (const std::exception& e) {
+        useCompiled = false;
+        fprintf(stderr, "[MPS] compile failed: %s\n", e.what());
     } catch (...) {
         useCompiled = false;
     }
 
-    while (true) {
-        std::vector<mlx::core::array> condResults;
-        if (useCompiled) {
-            condResults = compiledCond(loopVars);
-        } else {
+    if (useCompiled && tripCount >= 0) {
+        // Fastest path: counted loop. No condition eval, matching raw C++ MLX.
+        mlx::core::eval(loopVars[counterIdx]);
+        int64_t counter = loopVars[counterIdx].item<int32_t>();
+
+        std::vector<mlx::core::array> inputs = loopVars;
+        inputs.insert(inputs.end(), allExtArrays.begin(), allExtArrays.end());
+
+        for (int64_t i = counter; i < tripCount; ++i) {
+            auto bodyResults = compiledBody(inputs);
+            // Eval only non-counter results; counter is trivial (i+1).
+            std::vector<mlx::core::array> toEval;
+            for (size_t j = 0; j < nLoopVars; ++j) {
+                if (j != counterIdx)
+                    toEval.push_back(bodyResults[j]);
+            }
+            mlx::core::eval(toEval);
+            for (size_t j = 0; j < nLoopVars; ++j)
+                inputs[j] = std::move(bodyResults[j]);
+        }
+        loopVars.assign(inputs.begin(), inputs.begin() + nLoopVars);
+    } else if (useCompiled) {
+        // General while loop: body + cond each iteration.
+        std::vector<mlx::core::array> inputs = loopVars;
+        inputs.insert(inputs.end(), allExtArrays.begin(), allExtArrays.end());
+
+        while (true) {
+            // Evaluate condition via interpreted path (cond regions are tiny).
+            std::vector<mlx::core::array> condArgs = loopVars;
+            std::vector<mlx::core::array> condResults;
+            if (!ExecuteRegion(condRegion, condArgs, condResults, ctx, &values)) {
+                MPS_LOG_ERROR("stablehlo.while: failed to execute cond region\n");
+                return false;
+            }
+            mlx::core::eval(condResults[0]);
+            if (!condResults[0].item<bool>()) break;
+
+            auto results = compiledBody(inputs);
+            mlx::core::eval(results);
+            for (size_t j = 0; j < nLoopVars; ++j) {
+                loopVars[j] = results[j];
+                inputs[j] = std::move(results[j]);
+            }
+        }
+    } else {
+        // Fallback: interpreted MLIR walking (no compile).
+        while (true) {
+            std::vector<mlx::core::array> condResults;
             if (!ExecuteRegion(condRegion, loopVars, condResults, ctx, &values)) {
                 MPS_LOG_ERROR("stablehlo.while: failed to execute cond region\n");
                 return false;
             }
-        }
+            if (condResults.size() != 1) {
+                MPS_LOG_ERROR("stablehlo.while: cond should return 1 value, got %zu\n",
+                              condResults.size());
+                return false;
+            }
+            mlx::core::eval(condResults[0]);
+            if (!condResults[0].item<bool>()) break;
 
-        if (condResults.size() != 1) {
-            MPS_LOG_ERROR("stablehlo.while: cond region should return 1 value, got %zu\n",
-                          condResults.size());
-            return false;
-        }
-
-        // Only eval the condition — keep loop vars lazy until needed.
-        mlx::core::eval(condResults[0]);
-        auto condVal = condResults[0];
-
-        if (condVal.size() != 1) {
-            MPS_LOG_ERROR("stablehlo.while: condition must be a scalar, got size %zu\n",
-                          condVal.size());
-            return false;
-        }
-
-        if (!condVal.item<bool>()) {
-            break;
-        }
-
-        std::vector<mlx::core::array> bodyResults;
-        if (useCompiled) {
-            bodyResults = compiledBody(loopVars);
-        } else {
+            std::vector<mlx::core::array> bodyResults;
             if (!ExecuteRegion(bodyRegion, loopVars, bodyResults, ctx, &values)) {
                 MPS_LOG_ERROR("stablehlo.while: failed to execute body region\n");
                 return false;
             }
+            if (bodyResults.size() != nLoopVars) {
+                MPS_LOG_ERROR("stablehlo.while: body returned %zu values, expected %zu\n",
+                              bodyResults.size(), nLoopVars);
+                return false;
+            }
+            loopVars = std::move(bodyResults);
+            mlx::core::eval(loopVars);
         }
-
-        if (bodyResults.size() != loopVars.size()) {
-            MPS_LOG_ERROR("stablehlo.while: body returned %zu values, expected %zu\n",
-                          bodyResults.size(), loopVars.size());
-            return false;
-        }
-
-        loopVars = std::move(bodyResults);
     }
 
     for (size_t i = 0; i < loopVars.size(); ++i) {

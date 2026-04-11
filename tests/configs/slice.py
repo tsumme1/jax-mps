@@ -493,4 +493,31 @@ def make_slice_op_configs():
                 lambda key: random.randint(key, (4,), 0, 8),
                 name="gather_non_contiguous_window_dims_grad",
             ),
+            # Multi-axis window scatter with non-leading batch dims.
+            # The gradient of vmap(scan + gather + readout) produces a
+            # scatter-add with update_window_dims=[0,2,3] where dim 1
+            # (not dim 0) is the scatter batch dimension. The update
+            # extraction must use actual updateWindowDims positions to
+            # identify batch dims, not assume they are the first N dims.
+            OperationTestConfig(
+                lambda W, data: jnp.mean(
+                    jax.vmap(
+                        lambda d: (
+                            lambda ys: jnp.sum(ys[jnp.array([3, 7, 11, 15])] ** 2)
+                        )(
+                            lax.scan(
+                                lambda y, i: (
+                                    y + 1e-3 * jax.nn.sigmoid(jnp.concatenate([y, d[i]]) @ W),
+                                    y,
+                                ),
+                                jnp.zeros(8),
+                                jnp.arange(20),
+                            )[1]
+                        ),
+                    )(data)
+                ),
+                lambda key: random.normal(key, (12, 8)) * 0.01,
+                lambda key: random.normal(key, (3, 21, 4)) * 0.1,
+                name="multi_dim_window_scatter_nonleading_batch",
+            ),
         ]

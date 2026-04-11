@@ -91,3 +91,54 @@ def make_benchmark_op_configs() -> Generator[OperationTestConfig]:
                 lambda key, h=hidden: random.normal(key, (32, 128, h)),
                 name=f"layernorm_{hidden}",
             )
+
+        # Scan with GRU-style body: measures while-loop + eval overhead.
+        # The body does gate=sigmoid(x@Wg+h@Ug), cand=tanh(x@Wc+gate*h@Uc),
+        # h_new=(1-gate)*h+gate*cand — a realistic sequential neural net step.
+        def _gru_scan(params, xs):
+            Wg, Ug, Wc, Uc = params
+
+            def body(h, x):
+                gate = jax.nn.sigmoid(x @ Wg + h @ Ug)
+                cand = jnp.tanh(x @ Wc + gate * (h @ Uc))
+                h_new = (1 - gate) * h + gate * cand
+                return h_new, h_new
+
+            h0 = jnp.zeros(Wg.shape[1])
+            return jax.lax.scan(body, h0, xs)[1].sum()
+
+        hidden = 64
+        seq_len = 200
+        input_dim = 32
+        for unroll in [1, 10, 100]:
+            yield OperationTestConfig(
+                lambda params, xs, u=unroll: (
+                    lambda p, x: jax.lax.scan(
+                        lambda h, xi: (
+                            (
+                                lambda gate, cand: (
+                                    (1 - gate) * h + gate * cand,
+                                    (1 - gate) * h + gate * cand,
+                                )
+                            )(
+                                jax.nn.sigmoid(xi @ p[0] + h @ p[1]),
+                                jnp.tanh(
+                                    xi @ p[2]
+                                    + jax.nn.sigmoid(xi @ p[0] + h @ p[1]) * (h @ p[3])
+                                ),
+                            )
+                        ),
+                        jnp.zeros(p[0].shape[1]),
+                        x,
+                        unroll=u,
+                    )[1].sum()
+                )(params, xs),
+                lambda key, h=hidden, d=input_dim: (
+                    random.normal(random.split(key)[0], (d, h)) * 0.01,
+                    random.normal(random.split(key)[0], (h, h)) * 0.01,
+                    random.normal(random.split(key)[0], (d, h)) * 0.01,
+                    random.normal(random.split(key)[0], (h, h)) * 0.01,
+                ),
+                lambda key, s=seq_len, d=input_dim: random.normal(key, (s, d)),
+                name=f"scan_gru_h{hidden}_t{seq_len}_u{unroll}",
+            )

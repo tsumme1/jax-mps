@@ -431,21 +431,26 @@ bool HandleScatter(mlir::Operation* op, ValueMap& values, std::vector<mlx::core:
                         updateVal = mlx::core::squeeze(updateVal, squeezeDims);
                     }
                 } else {
-                    int numBatchDims = static_cast<int>(updateVal.ndim()) -
-                                       static_cast<int>(updateWindowDims.size());
+                    // Scatter batch dims are updates dims NOT in updateWindowDims.
+                    // These can be at any position (not necessarily the first N dims).
+                    std::vector<int> scatterBatchDims;
+                    for (int d = 0; d < static_cast<int>(updateVal.ndim()); ++d) {
+                        if (!windowDimSet.count(d)) {
+                            scatterBatchDims.push_back(d);
+                        }
+                    }
                     mlx::core::Shape starts(updateVal.ndim(), 0);
                     mlx::core::Shape stops(updateVal.shape().begin(), updateVal.shape().end());
                     int remaining = b;
-                    for (int bd = numBatchDims - 1; bd >= 0; --bd) {
-                        starts[bd] = remaining % updateVal.shape(bd);
-                        stops[bd] = starts[bd] + 1;
-                        remaining /= updateVal.shape(bd);
+                    for (int bd = static_cast<int>(scatterBatchDims.size()) - 1; bd >= 0; --bd) {
+                        int dim = scatterBatchDims[bd];
+                        starts[dim] = remaining % updateVal.shape(dim);
+                        stops[dim] = starts[dim] + 1;
+                        remaining /= updateVal.shape(dim);
                     }
                     updateVal = mlx::core::slice(updateVal, starts, stops);
-                    std::vector<int> squeezeDims;
-                    squeezeDims.reserve(numBatchDims);
-                    for (int d = 0; d < numBatchDims; ++d)
-                        squeezeDims.push_back(d);
+                    // Squeeze the batch dims (in reverse order to preserve indices)
+                    std::vector<int> squeezeDims(scatterBatchDims.begin(), scatterBatchDims.end());
                     if (!squeezeDims.empty()) {
                         updateVal = mlx::core::squeeze(updateVal, squeezeDims);
                     }

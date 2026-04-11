@@ -283,3 +283,17 @@ if(MLX_METALLIB)
 else()
     message(WARNING "mlx.metallib not found - Metal GPU kernels will not be available")
 endif()
+
+# ---- Benchmarks (only built with: cmake --build build --target bench_while_loop) ----
+add_executable(bench_while_loop EXCLUDE_FROM_ALL benchmarks/bench_while_loop.cc)
+target_link_libraries(bench_while_loop PRIVATE mlx ${METAL_FRAMEWORK} ${MPS_FRAMEWORK})
+set_target_properties(bench_while_loop PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/benchmarks"
+)
+if(MLX_METALLIB)
+    add_custom_command(TARGET bench_while_loop POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${MLX_METALLIB} $<TARGET_FILE_DIR:bench_while_loop>/mlx.metallib
+        COMMENT "Copying mlx.metallib alongside bench_while_loop"
+    )
+endif()
