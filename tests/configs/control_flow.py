@@ -6,6 +6,36 @@ from jax import numpy as jnp
 from .util import OperationTestConfig
 
 
+def _make_lstm_params(key, input_dim, hidden_dim):
+    keys = random.split(key, 8)
+    # Wi, Wf, Wc, Wo (input projections) + Ui, Uf, Uc, Uo (recurrent projections)
+    return tuple(
+        random.normal(k, (input_dim if i < 4 else hidden_dim, hidden_dim)) * 0.01
+        for i, k in enumerate(keys)
+    )
+
+
+def _lstm_step(carry, x):
+    (h, c), params = carry
+    Wi, Wf, Wc, Wo, Ui, Uf, Uc, Uo = params
+    i = jax.nn.sigmoid(x @ Wi + h @ Ui)
+    f = jax.nn.sigmoid(x @ Wf + h @ Uf)
+    g = jnp.tanh(x @ Wc + h @ Uc)
+    o = jax.nn.sigmoid(x @ Wo + h @ Uo)
+    c_new = f * c + i * g
+    h_new = o * jnp.tanh(c_new)
+    return ((h_new, c_new), params), h_new
+
+
+def _scan_lstm_loss(params):
+    """Loss function from issue #134 reproducer. Crashes with metal::malloc on main."""
+    hidden = 64
+    xs = jnp.ones((10_000, 32))
+    init = ((jnp.zeros(hidden), jnp.zeros(hidden)), params)
+    _, ys = jax.lax.scan(_lstm_step, init, xs)
+    return ys.sum()
+
+
 def _inner_fn_with_scan(x):
     """Simulates _preprocess from jax-baseline: uses lax.scan (→ stablehlo.while)."""
 
@@ -458,5 +488,17 @@ def make_control_flow_op_configs():
                 )[1],
                 lambda key: key,
                 name="lax.fori_loop.rng_scatter",
+            ),
+            # ==================== lax.scan regression (issue #134) ====================
+            # LSTM recurrence with grad: exercises the WhileLoopPrimitive
+            # graph-bounding path. 10_000 timesteps triggers graph explosion
+            # on main (metal::malloc crash). We bake jax.grad into the test
+            # function so the value test exercises the backward pass (the crash
+            # path) without comparing CPU vs MPS gradients at tight tolerance
+            # over 10k recurrent steps.
+            OperationTestConfig(
+                lambda params: jax.grad(_scan_lstm_loss)(params)[0].sum(),
+                lambda key: _make_lstm_params(key, 32, 64),
+                name="lax.scan.lstm_grad",
             ),
         ]
