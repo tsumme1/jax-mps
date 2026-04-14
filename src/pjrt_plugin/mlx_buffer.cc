@@ -38,10 +38,7 @@ mlx::core::Dtype PjrtDtypeToMlx(int dtype) {
         case PJRT_Buffer_Type_PRED:
             return mlx::core::bool_;
         case PJRT_Buffer_Type_F64:
-            throw std::runtime_error(
-                "MLX does not support float64 (F64). Use "
-                "jax.config.update('jax_enable_x64', False) "
-                "or ensure your arrays are float32.");
+            return mlx::core::float64;
         case PJRT_Buffer_Type_C64:
             return mlx::core::complex64;
         case PJRT_Buffer_Type_C128:
@@ -78,6 +75,8 @@ int MlxDtypeToPjrt(mlx::core::Dtype dtype) {
             return PJRT_Buffer_Type_U8;
         case mlx::core::bool_:
             return PJRT_Buffer_Type_PRED;
+        case mlx::core::float64:
+            return PJRT_Buffer_Type_F64;
         case mlx::core::complex64:
             return PJRT_Buffer_Type_C64;
         default:
@@ -249,6 +248,9 @@ std::unique_ptr<MlxBuffer> MlxBuffer::FromHostBuffer(const void* data, int dtype
             arr = mlx::core::array(static_cast<const mlx::core::complex64_t*>(data), mlx_shape,
                                    mlx_dtype);
             break;
+        case mlx::core::float64:
+            arr = mlx::core::array(static_cast<const double*>(data), mlx_shape, mlx_dtype);
+            break;
         default:
             // Fallback - treat as float32
             arr = mlx::core::array(static_cast<const float*>(data), mlx_shape, mlx_dtype);
@@ -321,7 +323,12 @@ bool MlxBuffer::ToHostBuffer(void* dst) {
     // Make the array contiguous (broadcasts create views that share memory)
     // and evaluate to ensure computation is complete
     try {
-        array_ = mlx::core::contiguous(array_);
+        if (array_.dtype() == mlx::core::float64) {
+            array_ = mlx::core::contiguous(
+                array_, false, mlx::core::Device(mlx::core::Device::cpu));
+        } else {
+            array_ = mlx::core::contiguous(array_);
+        }
         mlx::core::eval(array_);
     } catch (const std::exception& e) {
         MPS_LOG_ERROR("MLX eval failed in ToHostBuffer: %s\n", e.what());

@@ -730,7 +730,8 @@ bool HandleCustomCall(mlir::Operation* op, ValueMap& values, std::vector<mlx::co
             auto* input = RequireValue(values, op->getOperand(0), callTargetName.c_str());
             if (!input)
                 return false;
-            values.emplace(ToKey(op->getResult(0)), unaryIt->second(*input, {}));
+            values.emplace(ToKey(op->getResult(0)),
+                           unaryIt->second(*input, StreamForDtype(input->dtype())));
             return true;
         }
     }
@@ -932,14 +933,15 @@ bool HandleCustomCall(mlir::Operation* op, ValueMap& values, std::vector<mlx::co
         // Cast constants to input dtype to avoid f16→f32 promotion.
         auto dt = x->dtype();
         auto c = [dt](float v) { return mlx::core::astype(mlx::core::array(v), dt); };
-        auto x3 = mlx::core::multiply(mlx::core::multiply(*x, *x, {}), *x, {});
+        auto s = StreamForDtype(x->dtype());
+        auto x3 = mlx::core::multiply(mlx::core::multiply(*x, *x, s), *x, s);
         auto inner = mlx::core::multiply(
-            c(0.7978845608F), mlx::core::add(*x, mlx::core::multiply(c(0.044715F), x3, {}), {}),
-            {});
+            c(0.7978845608F), mlx::core::add(*x, mlx::core::multiply(c(0.044715F), x3, s), s),
+            s);
         auto result = mlx::core::multiply(
             c(0.5F),
-            mlx::core::multiply(*x, mlx::core::add(c(1.0F), mlx::core::tanh(inner, {}), {}), {}),
-            {});
+            mlx::core::multiply(*x, mlx::core::add(c(1.0F), mlx::core::tanh(inner, s), s), s),
+            s);
         values.emplace(ToKey(op->getResult(0)), std::move(result));
         return true;
     }
@@ -1089,14 +1091,15 @@ bool HandleCustomCall(mlir::Operation* op, ValueMap& values, std::vector<mlx::co
             const auto& x = primals[0];
             auto dt = x.dtype();
             auto c = [dt](float v) { return mlx::core::astype(mlx::core::array(v), dt); };
-            auto x3 = mlx::core::multiply(mlx::core::multiply(x, x, {}), x, {});
+            auto s = StreamForDtype(x.dtype());
+            auto x3 = mlx::core::multiply(mlx::core::multiply(x, x, s), x, s);
             auto inner = mlx::core::multiply(
-                c(0.7978845608F), mlx::core::add(x, mlx::core::multiply(c(0.044715F), x3, {}), {}),
-                {});
+                c(0.7978845608F), mlx::core::add(x, mlx::core::multiply(c(0.044715F), x3, s), s),
+                s);
             return std::vector<mlx::core::array>{mlx::core::multiply(
                 c(0.5F),
-                mlx::core::multiply(x, mlx::core::add(c(1.0F), mlx::core::tanh(inner, {}), {}), {}),
-                {})};
+                mlx::core::multiply(x, mlx::core::add(c(1.0F), mlx::core::tanh(inner, s), s), s),
+                s)};
         };
         auto [fwd_out, grads] = mlx::core::vjp(vjp_fn, {*x}, {*g});
         values.emplace(ToKey(op->getResult(0)), std::move(grads[0]));
@@ -1203,7 +1206,7 @@ bool HandleCustomCall(mlir::Operation* op, ValueMap& values, std::vector<mlx::co
             full_matrices = *v;
 
         auto a_contig = mlx::core::contiguous(*a);
-        auto results = mlx::core::linalg::svd(a_contig, compute_uv, {});
+        auto results = mlx::core::linalg::svd(a_contig, compute_uv, StreamForDtype(a->dtype()));
 
         if (compute_uv) {
             if (results.size() != 3) {
@@ -1281,14 +1284,17 @@ bool HandleComposite(mlir::Operation* op, ValueMap& values, std::vector<mlx::cor
         const auto& unaryOps = UnaryMlxOps();
         auto it = unaryOps.find(compName.substr(kChloPrefix.size()));
         if (it != unaryOps.end()) {
-            values.emplace(ToKey(op->getResult(0)), it->second(inputs[0], {}));
+            values.emplace(ToKey(op->getResult(0)),
+                           it->second(inputs[0], StreamForDtype(inputs[0].dtype())));
             return true;
         }
     }
 
     // Try native MLX dispatch for known two-input CHLO composite ops
     if (inputs.size() == 2 && op->getNumResults() == 1 && compositeName == "chlo.atan2") {
-        values.emplace(ToKey(op->getResult(0)), mlx::core::arctan2(inputs[0], inputs[1], {}));
+        values.emplace(ToKey(op->getResult(0)),
+                       mlx::core::arctan2(inputs[0], inputs[1],
+                                          StreamForDtypes(inputs[0].dtype(), inputs[1].dtype())));
         return true;
     }
 

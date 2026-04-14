@@ -488,7 +488,8 @@ bool HandleSign(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::ar
     auto result = mlx::core::sign(*x);
     auto dtype = x->dtype();
     bool isFloat = (dtype == mlx::core::float16 || dtype == mlx::core::bfloat16 ||
-                    dtype == mlx::core::float32 || dtype == mlx::core::complex64);
+                    dtype == mlx::core::float32 || dtype == mlx::core::float64 ||
+                    dtype == mlx::core::complex64);
     if (isFloat) {
         result = mlx::core::where(mlx::core::isnan(*x), *x, result);
     }

@@ -44,10 +44,6 @@ mlx::core::Dtype MlirTypeToMlxDtype(mlir::Type type) {
         MPS_LOG_ERROR("Unknown MLIR type, defaulting to float32\n");
         return mlx::core::float32;
     }
-    if (type.isF64()) {
-        MPS_LOG_WARN("MLX doesn't support float64, downcasting to float32\n");
-        return mlx::core::float32;
-    }
     return PjrtDtypeToMlx(pjrt_dtype);
 }
 
@@ -96,6 +92,8 @@ std::optional<mlx::core::array> CreateArrayWithTypedPtr(const void* data,
         case mlx::core::complex64:
             return mlx::core::array(reinterpret_cast<const mlx::core::complex64_t*>(data), shape,
                                     dtype);
+        case mlx::core::float64:
+            return mlx::core::array(reinterpret_cast<const double*>(data), shape, dtype);
         default:
             return std::nullopt;
     }
@@ -178,7 +176,8 @@ OpHandler MakeUnaryHandler(const char* opName, UnaryMlxFn fn) {
             MPS_LOG_ERROR("%s: operand not found in value map\n", opName);
             return false;
         }
-        values.emplace(ToKey(op->getResult(0)), fn(input_opt->get(), {}));
+        values.emplace(ToKey(op->getResult(0)),
+                       fn(input_opt->get(), StreamForDtype(input_opt->get().dtype())));
         return true;
     };
 }
@@ -192,7 +191,9 @@ OpHandler MakeBinaryHandler(const char* opName, BinaryMlxFn fn) {
             MPS_LOG_ERROR("%s: operand not found in value map\n", opName);
             return false;
         }
-        values.emplace(ToKey(op->getResult(0)), fn(lhs_opt->get(), rhs_opt->get(), {}));
+        values.emplace(ToKey(op->getResult(0)),
+                       fn(lhs_opt->get(), rhs_opt->get(),
+                          StreamForDtypes(lhs_opt->get().dtype(), rhs_opt->get().dtype())));
         return true;
     };
 }
@@ -213,7 +214,8 @@ OpHandler MakeLogicalShiftHandler(const char* opName, BinaryMlxFn shiftFn) {
         auto oob = mlx::core::logical_or(
             mlx::core::less(rhs, mlx::core::array(0, rhs.dtype())),
             mlx::core::greater_equal(rhs, mlx::core::array(bit_width, rhs.dtype())));
-        auto shifted = shiftFn(lhs, mlx::core::maximum(rhs, mlx::core::array(0, rhs.dtype())), {});
+        auto s = StreamForDtype(lhs.dtype());
+        auto shifted = shiftFn(lhs, mlx::core::maximum(rhs, mlx::core::array(0, rhs.dtype())), s);
         values.emplace(ToKey(op->getResult(0)), mlx::core::where(oob, zero, shifted));
         return true;
     };
@@ -323,6 +325,50 @@ const std::unordered_map<std::string, OpHandler>& GetOpHandlers() {
     return handlers;
 }
 
+// RAII guard to temporarily set the MLX default device.
+// Used to route float64 operations to the CPU stream.
+class DefaultDeviceGuard {
+public:
+    explicit DefaultDeviceGuard(bool use_cpu)
+        : original_(mlx::core::default_device()), use_cpu_(use_cpu) {
+        if (use_cpu_) {
+            mlx::core::set_default_device(mlx::core::Device(mlx::core::Device::cpu));
+        }
+    }
+    ~DefaultDeviceGuard() {
+        if (use_cpu_) {
+            mlx::core::set_default_device(original_);
+        }
+    }
+
+    DefaultDeviceGuard(const DefaultDeviceGuard&) = delete;
+    DefaultDeviceGuard& operator=(const DefaultDeviceGuard&) = delete;
+
+private:
+    mlx::core::Device original_;
+    bool use_cpu_;
+};
+
+// Check if any operand or result of an op involves float64.
+bool HasFloat64(mlir::Operation* op, const ValueMap& values) {
+    // Check operands in the value map
+    for (auto operand : op->getOperands()) {
+        auto it = values.find(ToKey(operand));
+        if (it != values.end() && it->second.dtype() == mlx::core::float64) {
+            return true;
+        }
+    }
+    // Check result types (handles convert/broadcast that produce f64 from non-f64 inputs)
+    for (auto result : op->getResults()) {
+        if (auto rtt = mlir::dyn_cast<mlir::RankedTensorType>(result.getType())) {
+            if (rtt.getElementType().isF64()) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 // Dispatch a single operation using the handler table
 bool DispatchOp(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::array>& outputs,
                 ExecContext& ctx) {
@@ -336,6 +382,12 @@ bool DispatchOp(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::ar
         MPS_LOG_ERROR("Unsupported op: %s\n", opName.c_str());
         return false;
     }
+
+    // If any operand or result is float64, temporarily set the default device to CPU.
+    // This ensures all MLX function calls within the handler (even those without
+    // explicit stream args) will use the CPU stream. mx::compile() handles mixed
+    // CPU/GPU graphs natively, so this is safe.
+    DefaultDeviceGuard guard(HasFloat64(op, values));
 
     try {
         if (IsProfilingEnabled()) {

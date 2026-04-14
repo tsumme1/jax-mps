@@ -47,6 +47,22 @@ using UnaryMlxFn = mlx::core::array (*)(const mlx::core::array&, mlx::core::Stre
 using BinaryMlxFn = mlx::core::array (*)(const mlx::core::array&, const mlx::core::array&,
                                          mlx::core::StreamOrDevice);
 
+// Route float64 operations to the CPU stream. MLX supports float64 on CPU only;
+// Apple Silicon's unified memory means no data copy is needed, and mx::compile()
+// handles mixed CPU/GPU graphs natively with parallel execution.
+inline mlx::core::StreamOrDevice StreamForDtype(mlx::core::Dtype dtype) {
+    if (dtype == mlx::core::float64)
+        return mlx::core::Device::cpu;
+    return {};  // default GPU stream
+}
+
+// For binary ops, pick CPU stream if either operand is float64.
+inline mlx::core::StreamOrDevice StreamForDtypes(mlx::core::Dtype a, mlx::core::Dtype b) {
+    if (a == mlx::core::float64 || b == mlx::core::float64)
+        return mlx::core::Device::cpu;
+    return {};
+}
+
 // --- Utility functions (defined in mlx_executable.cc) ---
 
 void* ToKey(mlir::Value v);
