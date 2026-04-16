@@ -164,12 +164,13 @@ public:
     WhileLoopPrimitive(mlx::core::Stream stream, BodyFn bodyFn, size_t nLoopVars, size_t nExt,
                        size_t counterIdx, int64_t tripCount)
         : Primitive(stream),
-          bodyFnId_(nextFnId()),
-          compiledBody_(mlx::core::detail::compile(std::move(bodyFn), bodyFnId_)),
+          cacheGuard_(std::make_shared<CacheGuard>()),
           nLoopVars_(nLoopVars),
           nExt_(nExt),
           counterIdx_(counterIdx),
           tripCount_(tripCount) {
+        cacheGuard_->bodyId = nextFnId();
+        compiledBody_ = mlx::core::detail::compile(std::move(bodyFn), cacheGuard_->bodyId);
         if (stream.device != mlx::core::Device::cpu) {
             throw std::runtime_error(
                 "WhileLoopPrimitive must be on the CPU stream \u2014 GPU stream "
@@ -186,14 +187,15 @@ public:
     WhileLoopPrimitive(mlx::core::Stream stream, CondFn condFn, BodyFn bodyCondFn,
                        size_t nLoopVars, size_t nExt)
         : Primitive(stream),
-          bodyCondFnId_(nextFnId()),
-          condFnId_(nextFnId()),
-          compiledBodyCond_(mlx::core::detail::compile(std::move(bodyCondFn), bodyCondFnId_)),
-          compiledCond_(mlx::core::detail::compile(std::move(condFn), condFnId_)),
+          cacheGuard_(std::make_shared<CacheGuard>()),
           nLoopVars_(nLoopVars),
           nExt_(nExt),
           counterIdx_(0),
           tripCount_(-1) {
+        cacheGuard_->bodyCondId = nextFnId();
+        cacheGuard_->condId = nextFnId();
+        compiledBodyCond_ = mlx::core::detail::compile(std::move(bodyCondFn), cacheGuard_->bodyCondId);
+        compiledCond_ = mlx::core::detail::compile(std::move(condFn), cacheGuard_->condId);
         if (stream.device != mlx::core::Device::cpu) {
             throw std::runtime_error(
                 "WhileLoopPrimitive must be on the CPU stream \u2014 GPU stream "
@@ -258,7 +260,8 @@ private:
                     throw std::runtime_error("WhileLoopPrimitive: body returned " +
                                              std::to_string(bodyResults.size()) +
                                              " results, expected " + std::to_string(nLoopVars_));
-                mlx::core::async_eval(bodyResults);
+                if (i == tripCount_ - 1)
+                    mlx::core::eval(bodyResults);
                 for (size_t j = 0; j < nLoopVars_; ++j)
                     current[j] = bodyResults[j];
             }
@@ -318,9 +321,35 @@ private:
         static std::atomic<std::uintptr_t> counter{0x7F00'0000'0000'0000ULL};
         return counter.fetch_add(1, std::memory_order_relaxed);
     }
-    std::uintptr_t bodyFnId_ = 0;
-    std::uintptr_t bodyCondFnId_ = 0;
-    std::uintptr_t condFnId_ = 0;
+
+    // CacheGuard: shared_ptr-based ref-counted cleanup.
+    // compile_erase is called only when the LAST copy of the primitive
+    // is destroyed — safe across copy/move during graph building.
+    // Skips cleanup during process shutdown to avoid SIGSEGV on
+    // already-destroyed CompilerCache.
+    struct CacheGuard {
+        std::uintptr_t bodyId = 0;
+        std::uintptr_t bodyCondId = 0;
+        std::uintptr_t condId = 0;
+        CacheGuard() {
+            static std::once_flag once;
+            std::call_once(once, [] {
+                std::atexit([] { shuttingDown().store(true, std::memory_order_relaxed); });
+            });
+        }
+        ~CacheGuard() {
+            if (shuttingDown().load(std::memory_order_relaxed))
+                return;
+            // if (bodyId) mlx::core::detail::compile_erase(bodyId);
+            // if (bodyCondId) mlx::core::detail::compile_erase(bodyCondId);
+            // if (condId) mlx::core::detail::compile_erase(condId);
+        }
+        static std::atomic<bool>& shuttingDown() {
+            static std::atomic<bool> flag{false};
+            return flag;
+        }
+    };
+    std::shared_ptr<CacheGuard> cacheGuard_;
 };
 // Handler for stablehlo.while
 bool HandleWhile(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::array>& outputs,
