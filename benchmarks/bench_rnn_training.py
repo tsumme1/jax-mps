@@ -20,11 +20,11 @@ import os
 import time
 from functools import partial
 
+os.environ.setdefault("JAX_PLATFORMS", "mps")
+
 import jax
 import jax.numpy as jnp
 from jax import lax, random
-
-os.environ.setdefault("JAX_PLATFORMS", "mps")
 
 BATCH_SIZE = 32
 SEQ_LEN = 200
@@ -38,7 +38,9 @@ INPUT_DIM = 64
 def init_gru_params(key, input_dim, hidden_dim, output_dim):
     """Initialize GRU + linear readout parameters."""
     keys = random.split(key, 8)
-    scale = lambda shape: 1.0 / jnp.sqrt(shape[-1])
+    def scale(shape):
+        return 1.0 / jnp.sqrt(shape[-1])
+
     params = {
         # GRU gates
         "Wz": random.normal(keys[0], (input_dim, hidden_dim)) * scale((input_dim,)),
@@ -140,6 +142,7 @@ def bench_training(warmup=3, repeats=10):
                 # Timed runs
                 times = []
                 p = params
+                loss = jnp.array(0.0)
                 for _ in range(repeats):
                     t0 = time.perf_counter()
                     p, loss = step_jit(p, xs, targets)

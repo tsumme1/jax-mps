@@ -3,6 +3,8 @@
 
 #include <mlx/mlx.h>
 
+#include <atomic>
+#include <cstdlib>
 #include <functional>
 #include <optional>
 #include <stdexcept>
@@ -22,6 +24,26 @@
 #include "pjrt_plugin/type_utils.h"
 
 namespace jax_mps {
+
+// Process-global shutdown flag. Guards compile_erase calls in destructors
+// that run during static destruction — the MLX CompilerCache may already
+// be destroyed, and calling compile_erase would SIGSEGV / double-free.
+// The atexit hook is registered at static initialization time so the flag
+// is reliably set before any shutdown-time destructors run.
+inline std::atomic<bool>& ProcessShutdownFlag() {
+    static std::atomic<bool> flag{false};
+    return flag;
+}
+
+inline const int kProcessShutdownHookInstalled = [] {
+    std::atexit([] { ProcessShutdownFlag().store(true, std::memory_order_relaxed); });
+    return 0;
+}();
+
+inline bool IsProcessShuttingDown() {
+    (void)kProcessShutdownHookInstalled;
+    return ProcessShutdownFlag().load(std::memory_order_relaxed);
+}
 
 // Value map type using void* as key (from mlir::Value's opaque pointer)
 using ValueMap = std::unordered_map<void*, mlx::core::array>;
