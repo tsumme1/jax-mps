@@ -3,14 +3,17 @@
 
 #include <mlx/compile.h>
 #include <mlx/compile_impl.h>
+
 #include <mlx/fast.h>
 #include <mlx/linalg.h>
+#include <mlx/primitives.h>
 #include <mlx/random.h>
 #include <mlx/transforms.h>
 
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 
 #include "llvm/Support/JSON.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -136,6 +139,7 @@ void CollectExternalValues(mlir::Region& region, const ValueMap& values, std::ve
     });
 }
 
+
 // Custom MLX primitive that encapsulates a while-loop with compiled body
 // and per-step eval. This is opaque to mx::compile (won't be fused) but
 // doesn't prevent outer compilation. When eval is called on the compiled
@@ -260,8 +264,7 @@ private:
                     throw std::runtime_error("WhileLoopPrimitive: body returned " +
                                              std::to_string(bodyResults.size()) +
                                              " results, expected " + std::to_string(nLoopVars_));
-                if (i == tripCount_ - 1)
-                    mlx::core::eval(bodyResults);
+                mlx::core::eval(bodyResults);
                 for (size_t j = 0; j < nLoopVars_; ++j)
                     current[j] = bodyResults[j];
             }
@@ -316,6 +319,7 @@ private:
     size_t counterIdx_;
     int64_t tripCount_;
 
+
 private:
     static std::uintptr_t nextFnId() {
         static std::atomic<std::uintptr_t> counter{0x7F00'0000'0000'0000ULL};
@@ -340,9 +344,9 @@ private:
         ~CacheGuard() {
             if (shuttingDown().load(std::memory_order_relaxed))
                 return;
-            // if (bodyId) mlx::core::detail::compile_erase(bodyId);
-            // if (bodyCondId) mlx::core::detail::compile_erase(bodyCondId);
-            // if (condId) mlx::core::detail::compile_erase(condId);
+            if (bodyId) mlx::core::detail::compile_erase(bodyId);
+            if (bodyCondId) mlx::core::detail::compile_erase(bodyCondId);
+            if (condId) mlx::core::detail::compile_erase(condId);
         }
         static std::atomic<bool>& shuttingDown() {
             static std::atomic<bool> flag{false};
@@ -376,13 +380,10 @@ bool HandleWhile(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::a
         auto& bodyRegion = whileOp.getBody();
         const size_t nLoopVars = loopVars.size();
 
-        // Counted-loop detection: check if cond is "counter < constant"
-        // AND the body increments the counter by exactly +1.
-        // This is conservative to avoid misclassifying loops where the counter
-        // is updated by != 1, or the cond has additional logic beyond the compare.
+        // DIAGNOSTIC: force all loops through dynamic path
         int64_t tripCount = -1;
         size_t counterIdx = 0;
-        {
+        if (false) {
             auto& condBlock = condRegion.front();
             mlir::Operation* cmpOp = nullptr;
             for (auto& innerOp : condBlock.getOperations()) {

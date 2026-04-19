@@ -7,6 +7,7 @@
 #include <mlx/memory.h>
 #include <mlx/mlx.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -488,7 +489,16 @@ MlxExecutable::~MlxExecutable() {
     // this, the cache holds a CacheEntry — including the full traced tape and
     // any captured constants — for the lifetime of the process, even after JAX
     // evicts this executable.
-    if (compile_attempted_) {
+    //
+    // Skip during process shutdown: the static CompilerCache may already be
+    // destroyed, and calling compile_erase on it would SIGSEGV / double-free.
+    static std::atomic<bool> shutting_down{false};
+    static std::once_flag once;
+    std::call_once(once, [] {
+        std::atexit([] { shutting_down.store(true, std::memory_order_relaxed); });
+    });
+
+    if (compile_attempted_ && !shutting_down.load(std::memory_order_relaxed)) {
         mlx::core::detail::compile_erase(reinterpret_cast<std::uintptr_t>(this));
     }
 }
