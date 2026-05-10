@@ -107,6 +107,18 @@ find_library(VERSION_LIB Version HINTS ${CMAKE_PREFIX_PATH} PATH_SUFFIXES lib)
 # Note: MLX's linalg GPU patch uses MetalPerformanceShaders symbols. Since MLX
 # is a static library, these are resolved at final link time via MPS_FRAMEWORK
 # on pjrt_plugin_mps below.
+#
+# MLX v0.31.2+ on macOS 26.2+ SDK unconditionally builds jaccl (Apple's
+# collective comms library). jaccl installs its own targets file but lacks a
+# proper jacclConfig.cmake, so find_package(jaccl) fails. Pre-include the
+# targets file directly, falling back to a dummy INTERFACE target.
+set(_JACCL_TARGETS "${CMAKE_PREFIX_PATH}/lib/cmake/jaccl/jacclTargets.cmake")
+if(EXISTS "${_JACCL_TARGETS}" AND NOT TARGET jaccl::jaccl)
+    include("${_JACCL_TARGETS}")
+elseif(NOT TARGET jaccl::jaccl)
+    add_library(jaccl::jaccl INTERFACE IMPORTED)
+endif()
+
 find_package(MLX REQUIRED CONFIG)
 message(STATUS "Found MLX: ${MLX_DIR}")
 

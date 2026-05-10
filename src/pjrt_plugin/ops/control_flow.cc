@@ -265,6 +265,116 @@ private:
     size_t nLoopVars_;
     size_t nExt_;
 };
+
+// Custom MLX primitive that encapsulates a multi-branch case/switch with
+// compiled branches and CPU-orchestrated branch selection. This is opaque to
+// mx::compile (won't be fused) but doesn't prevent outer compilation.
+//
+// Stream placement: Same rationale as WhileLoopPrimitive — MUST run on the
+// CPU stream. The CPU side reads the branch index scalar, selects the
+// appropriate compiled branch function, and calls it. The compiled branch
+// internally dispatches GPU kernels via MLX's default GPU stream.
+//
+// All branches are pre-compiled at construction time. Only the selected
+// branch executes at eval time.
+class CasePrimitive : public mlx::core::Primitive {
+public:
+    using CompiledFn =
+        std::function<std::vector<mlx::core::array>(const std::vector<mlx::core::array>&)>;
+
+    // indexFn: compiled function that takes external values and returns [index_scalar].
+    //   This is evaluated at runtime to determine which branch to take, ensuring
+    //   that mx::compile correctly re-evaluates the index from function arguments.
+    // branches: one compiled function per branch region.
+    //   Each takes external values as inputs and returns branch results.
+    // nOutputs: number of outputs (same for all branches, from MLIR types).
+    // nExt: number of external captures threaded as inputs.
+    // outShapes/outDtypes: output shapes and dtypes from MLIR result types.
+    CasePrimitive(mlx::core::Stream stream, CompiledFn indexFn,
+                  std::vector<CompiledFn> branches, size_t nOutputs,
+                  size_t nExt, std::vector<mlx::core::Shape> outShapes,
+                  std::vector<mlx::core::Dtype> outDtypes)
+        : Primitive(stream),
+          indexFn_(std::move(indexFn)),
+          branches_(std::move(branches)),
+          nOutputs_(nOutputs),
+          nExt_(nExt),
+          outShapes_(std::move(outShapes)),
+          outDtypes_(std::move(outDtypes)) {
+        if (stream.device.type != mlx::core::Device::cpu) {
+            throw std::runtime_error(
+                "CasePrimitive must be on the CPU stream — GPU stream "
+                "placement would deadlock on internal eval() calls");
+        }
+    }
+
+    void eval_cpu(const std::vector<mlx::core::array>& inputs,
+                  std::vector<mlx::core::array>& outputs) override {
+        eval_impl(inputs, outputs);
+    }
+
+    void eval_gpu(const std::vector<mlx::core::array>& inputs,
+                  std::vector<mlx::core::array>& outputs) override {
+        eval_impl(inputs, outputs);
+    }
+
+    const char* name() const override {
+        return "Case";
+    }
+
+    bool is_equivalent(const mlx::core::Primitive& other) const override {
+        return false;
+    }
+
+    std::vector<mlx::core::Shape> output_shapes(
+        const std::vector<mlx::core::array>& inputs) override {
+        return outShapes_;
+    }
+
+private:
+    void eval_impl(const std::vector<mlx::core::array>& inputs,
+                   std::vector<mlx::core::array>& outputs) {
+        // inputs = external values (nExt_)
+        if (inputs.size() != nExt_)
+            throw std::runtime_error("CasePrimitive: expected " + std::to_string(nExt_) +
+                                     " inputs, got " + std::to_string(inputs.size()));
+
+        // Evaluate the index via the compiled index function.
+        // This correctly re-computes the index from function arguments at
+        // runtime, avoiding stale values from mx::compile's graph caching.
+        auto indexResult = indexFn_(inputs);
+        if (indexResult.size() != 1 || indexResult[0].size() != 1)
+            throw std::runtime_error("CasePrimitive: indexFn must return a single scalar");
+        mlx::core::eval(indexResult[0]);
+        int branchIdx = indexResult[0].item<int>();
+
+        // Clamp to valid range [0, numBranches-1] per StableHLO spec.
+        int numBranches = static_cast<int>(branches_.size());
+        if (branchIdx < 0 || branchIdx >= numBranches)
+            branchIdx = numBranches - 1;
+
+        // Execute the selected compiled branch.
+        auto branchResults = branches_[branchIdx](inputs);
+        if (branchResults.size() != nOutputs_)
+            throw std::runtime_error("CasePrimitive: branch " + std::to_string(branchIdx) +
+                                     " returned " + std::to_string(branchResults.size()) +
+                                     " results, expected " + std::to_string(nOutputs_));
+
+        // Synchronous eval — single branch execution, bounded graph.
+        mlx::core::eval(branchResults);
+
+        for (size_t i = 0; i < nOutputs_; ++i)
+            outputs[i].copy_shared_buffer(branchResults[i]);
+    }
+
+    CompiledFn indexFn_;
+    std::vector<CompiledFn> branches_;
+    size_t nOutputs_;
+    size_t nExt_;
+    std::vector<mlx::core::Shape> outShapes_;
+    std::vector<mlx::core::Dtype> outDtypes_;
+};
+
 // Handler for stablehlo.while
 bool HandleWhile(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::array>& outputs,
                  ExecContext& ctx) {
@@ -541,9 +651,242 @@ bool HandleCase(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::ar
     if (!index)
         return false;
 
-    if (ctx.inside_compile) {
-        throw CompileIncompatibleError("stablehlo.case requires eval()");
+    if (ctx.inside_compile && ctx.allow_while_primitive) {
+        // --- Custom primitive approach ---
+        // Instead of throwing CompileIncompatibleError, create a CasePrimitive
+        // that is opaque to mx::compile but executes the selected branch with
+        // compiled body + eval when eval'd.
+
+        auto branches = caseOp.getBranches();
+        const size_t numBranches = branches.size();
+        const size_t nOutputs = op->getNumResults();
+
+        // Collect external values referenced by ALL branch regions.
+        std::vector<void*> extKeys;
+        std::vector<mlx::core::array> extArrays;
+        std::unordered_set<void*> seen;
+        for (size_t b = 0; b < numBranches; ++b)
+            CollectExternalValues(branches[b], values, extKeys, extArrays, &seen);
+
+        // Add ALL function block arguments as dependencies.
+        // mx::compile only re-evaluates arrays that directly trace back to
+        // function inputs. Intermediate results (e.g., clamp output) get frozen
+        // to their first-call values. By including all block arguments, we
+        // ensure the CasePrimitive receives fresh, substituted values.
+        auto& parentBlock = *op->getBlock();
+        for (auto arg : parentBlock.getArguments()) {
+            void* argKey = ToKey(arg);
+            if (!seen.count(argKey)) {
+                auto it = values.find(argKey);
+                if (it != values.end()) {
+                    seen.insert(argKey);
+                    extKeys.push_back(argKey);
+                    extArrays.push_back(it->second);
+                }
+            }
+        }
+
+        // Determine how to compute the index from the external values.
+        // The case op's index operand is typically an intermediate (e.g.,
+        // clamp(const, argN, const)). Since mx::compile freezes intermediates,
+        // we build an indexFn that re-computes the index from raw function
+        // arguments at runtime.
+        //
+        // Strategy: walk the SSA chain from caseOp.getIndex() to find the
+        // function argument it depends on. For the common pattern:
+        //   %c = constant 0
+        //   %c_0 = constant N-1
+        //   %idx = clamp(%c, %argK, %c_0)
+        // we reconstruct the clamp inside indexFn. For other patterns, we
+        // fall back to including the index directly (which only works for
+        // trivial cases where the index IS a function argument).
+
+        // Find the position of each function argument in extArrays for lookup.
+        std::unordered_map<void*, size_t> keyToPos;
+        for (size_t i = 0; i < extKeys.size(); ++i)
+            keyToPos[extKeys[i]] = i;
+
+        // Try to decompose the index operand.
+        mlir::Value indexVal = caseOp.getIndex();
+        auto* indexDefOp = indexVal.getDefiningOp();
+
+        size_t indexArgPos = SIZE_MAX;
+        bool needsClamp = false;
+        int clampMin = 0;
+        int clampMax = static_cast<int>(numBranches) - 1;
+
+        if (indexDefOp) {
+            // Check if the index is defined by a clamp op.
+            if (auto clampOp = mlir::dyn_cast<mlir::stablehlo::ClampOp>(indexDefOp)) {
+                // clamp(min_const, operand, max_const)
+                mlir::Value operand = clampOp.getOperand();
+                void* operandKey = ToKey(operand);
+                auto posIt = keyToPos.find(operandKey);
+                if (posIt != keyToPos.end()) {
+                    indexArgPos = posIt->second;
+                } else {
+                    // The operand isn't in extKeys yet (e.g., nested case where
+                    // %arg1 is only used by the clamp, not the branches). Add it.
+                    auto valIt = values.find(operandKey);
+                    if (valIt != values.end()) {
+                        indexArgPos = extKeys.size();
+                        extKeys.push_back(operandKey);
+                        extArrays.push_back(valIt->second);
+                        keyToPos[operandKey] = indexArgPos;
+                    }
+                }
+                if (indexArgPos != SIZE_MAX) {
+                    needsClamp = true;
+                    // Extract clamp bounds from the MLIR constants.
+                    if (auto minOp = clampOp.getMin().getDefiningOp<mlir::stablehlo::ConstantOp>()) {
+                        if (auto attr = mlir::dyn_cast<mlir::DenseIntElementsAttr>(minOp.getValue()))
+                            clampMin = (*attr.begin()).getSExtValue();
+                    }
+                    if (auto maxOp = clampOp.getMax().getDefiningOp<mlir::stablehlo::ConstantOp>()) {
+                        if (auto attr = mlir::dyn_cast<mlir::DenseIntElementsAttr>(maxOp.getValue()))
+                            clampMax = (*attr.begin()).getSExtValue();
+                    }
+                }
+            }
+
+            // Check if the index is a convert (e.g., bool -> int32 for lax.cond).
+            if (indexArgPos == SIZE_MAX) {
+                if (auto convertOp = mlir::dyn_cast<mlir::stablehlo::ConvertOp>(indexDefOp)) {
+                    void* srcKey = ToKey(convertOp.getOperand());
+                    auto posIt = keyToPos.find(srcKey);
+                    if (posIt != keyToPos.end()) {
+                        indexArgPos = posIt->second;
+                    } else {
+                        auto valIt = values.find(srcKey);
+                        if (valIt != values.end()) {
+                            indexArgPos = extKeys.size();
+                            extKeys.push_back(srcKey);
+                            extArrays.push_back(valIt->second);
+                            keyToPos[srcKey] = indexArgPos;
+                        }
+                    }
+                }
+            }
+        }
+
+        // If the index IS already a function argument or external value:
+        if (indexArgPos == SIZE_MAX) {
+            void* idxKey = ToKey(indexVal);
+            auto posIt = keyToPos.find(idxKey);
+            if (posIt != keyToPos.end()) {
+                indexArgPos = posIt->second;
+            }
+        }
+
+        // Fallback: add the index directly (works when the index is a direct
+        // function argument, but freezes for intermediates).
+        if (indexArgPos == SIZE_MAX) {
+            indexArgPos = extArrays.size();
+            extKeys.push_back(ToKey(indexVal));
+            extArrays.push_back(*index);
+        }
+
+        const size_t nExt = extKeys.size();
+        auto module = ctx.module;
+
+        // Build compiled index function that re-computes the index at runtime.
+        CasePrimitive::CompiledFn compiledIndexFn;
+        if (needsClamp) {
+            compiledIndexFn = mlx::core::compile(
+                [indexArgPos, clampMin, clampMax](
+                    const std::vector<mlx::core::array>& inputs) -> std::vector<mlx::core::array> {
+                auto val = mlx::core::astype(inputs[indexArgPos], mlx::core::int32);
+                auto result = mlx::core::clip(val,
+                    mlx::core::array(clampMin, mlx::core::int32),
+                    mlx::core::array(clampMax, mlx::core::int32));
+                return {result};
+            });
+        } else {
+            compiledIndexFn = mlx::core::compile(
+                [indexArgPos](
+                    const std::vector<mlx::core::array>& inputs) -> std::vector<mlx::core::array> {
+                return {mlx::core::astype(inputs[indexArgPos], mlx::core::int32)};
+            });
+        }
+
+        // Build one compiled function per branch.
+        // NOTE: We capture a raw pointer to the CaseOp (owned by the MLIR module,
+        // kept alive via ctx.module). We must NOT capture `branches` by reference —
+        // it's a local MutableArrayRef that goes out of scope after HandleCase returns.
+        auto* caseOpPtr = caseOp.getOperation();
+        std::vector<CasePrimitive::CompiledFn> compiledBranches;
+        compiledBranches.reserve(numBranches);
+        for (size_t b = 0; b < numBranches; ++b) {
+            auto branchFn =
+                [caseOpPtr, b, module, extKeys,
+                 nExt](const std::vector<mlx::core::array>& inputs) -> std::vector<mlx::core::array> {
+                // inputs = external values
+                ValueMap parentVals;
+                for (size_t i = 0; i < nExt; ++i)
+                    parentVals.emplace(extKeys[i], inputs[i]);
+                // Access the branch region through the op (owned by the module).
+                auto regionCaseOp = mlir::cast<mlir::stablehlo::CaseOp>(caseOpPtr);
+                auto& branchRegion = regionCaseOp.getBranches()[b];
+                // Branch regions have no block arguments.
+                std::vector<mlx::core::array> branchArgs;
+                std::vector<mlx::core::array> results;
+                ExecContext branchCtx;
+                branchCtx.module = module;
+                branchCtx.inside_compile = true;
+                branchCtx.allow_while_primitive = true;
+                if (!ExecuteRegion(branchRegion, branchArgs, results, branchCtx, &parentVals))
+                    throw std::runtime_error("CasePrimitive: branch " + std::to_string(b) +
+                                             " execution failed");
+                return results;
+            };
+            compiledBranches.push_back(mlx::core::compile(std::move(branchFn)));
+        }
+
+        // Derive output shapes/dtypes from MLIR result types.
+        std::vector<mlx::core::Shape> outShapes;
+        outShapes.reserve(nOutputs);
+        std::vector<mlx::core::Dtype> outDtypes;
+        outDtypes.reserve(nOutputs);
+        for (size_t i = 0; i < nOutputs; ++i) {
+            auto resultType =
+                mlir::dyn_cast<mlir::RankedTensorType>(op->getResult(i).getType());
+            if (resultType) {
+                outShapes.push_back(GetShape(resultType));
+                outDtypes.push_back(MlirTypeToMlxDtype(resultType.getElementType()));
+            } else {
+                outShapes.push_back({});
+                outDtypes.push_back(mlx::core::float32);
+            }
+        }
+
+        // Build primitive inputs: external values only (index is in extArrays).
+        std::vector<mlx::core::array> primInputs = extArrays;
+
+        // CPU stream for orchestration — same rationale as WhileLoopPrimitive.
+        auto cpuStream = mlx::core::default_stream(mlx::core::Device::cpu);
+        // Copy outShapes for the primitive; move original into make_arrays.
+        auto primShapes = outShapes;
+        auto prim = std::make_shared<CasePrimitive>(cpuStream, std::move(compiledIndexFn),
+                                                     std::move(compiledBranches),
+                                                     nOutputs, nExt, std::move(primShapes),
+                                                     outDtypes);
+
+        auto outputArrays =
+            mlx::core::array::make_arrays(std::move(outShapes), outDtypes, prim, primInputs);
+        for (size_t i = 0; i < nOutputs; ++i)
+            values.emplace(ToKey(op->getResult(i)), std::move(outputArrays[i]));
+        return true;
     }
+
+    // inside_compile == true but allow_while_primitive == false:
+    // Throw to trigger fallback to uncompiled execution (same as WhileLoopPrimitive).
+    if (ctx.inside_compile) {
+        throw CompileIncompatibleError(
+            "stablehlo.case: CasePrimitive requires allow_while_primitive; "
+            "falling back to uncompiled execution");
+    }
+
+    // --- Eager (non-compile) path ---
     mlx::core::eval(*index);
     int branchIdx = index->item<int>();
 
