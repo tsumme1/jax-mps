@@ -382,10 +382,11 @@ bool HandleWhile(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::a
     if (!whileOp)
         return false;
 
-    if (ctx.inside_compile) {
+    if (ctx.inside_compile && ctx.allow_while_primitive) {
         // --- Custom primitive approach ---
-        // Create a WhileLoopPrimitive that is opaque to mx::compile but runs
-        // the loop with compiled body + per-step eval when eval'd.
+        // Instead of throwing CompileIncompatibleError, we create a
+        // WhileLoopPrimitive that is opaque to mx::compile but runs the
+        // loop with compiled body + per-step eval when eval'd.
 
         std::vector<mlx::core::array> loopVars;
         for (auto operand : op->getOperands()) {
@@ -437,7 +438,7 @@ bool HandleWhile(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::a
             ExecContext compileCtx;
             compileCtx.module = module;
             compileCtx.inside_compile = true;
-
+            compileCtx.allow_while_primitive = true;
             if (!ExecuteRegion(condRegion, args, results, compileCtx, &parentVals))
                 throw std::runtime_error("WhileLoopPrimitive: cond region execution failed");
             return results;
@@ -463,7 +464,7 @@ bool HandleWhile(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::a
             ExecContext bodyCtx;
             bodyCtx.module = module;
             bodyCtx.inside_compile = true;
-
+            bodyCtx.allow_while_primitive = true;
             if (!ExecuteRegion(bodyRegion, args, bodyResults, bodyCtx, &parentVals))
                 throw std::runtime_error("WhileLoopPrimitive: body region failed");
 
@@ -475,7 +476,7 @@ bool HandleWhile(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::a
             ExecContext condCtx;
             condCtx.module = module;
             condCtx.inside_compile = true;
-
+            condCtx.allow_while_primitive = true;
             if (!ExecuteRegion(condRegion, bodyResults, condResults, condCtx, &condParentVals))
                 throw std::runtime_error("WhileLoopPrimitive: cond region failed");
             if (condResults.size() != 1 || condResults[0].size() != 1)
@@ -501,6 +502,24 @@ bool HandleWhile(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::a
         for (size_t i = 0; i < nLoopVars; ++i)
             values.emplace(ToKey(op->getResult(i)), std::move(outputArrays[i]));
         return true;
+    }
+
+    // inside_compile == true but allow_while_primitive == false:
+    // This only happens for nested while-loops inside the *eager* (non-JIT)
+    // path's mx::compile optimization probe (lines below). That probe
+    // captures &values by reference, so a WhileLoopPrimitive created here
+    // would bake stale external values as constants → infinite loop.
+    //
+    // Under jax.jit(), the PJRT compile path (mlx_executable.cc) sets
+    // allow_while_primitive=true, so nested while-loops always take the
+    // WhileLoopPrimitive path above and never reach here.
+    //
+    // Throwing causes the probe to fail gracefully, falling back to the
+    // uncompiled ExecuteRegion loop for this outer while.
+    if (ctx.inside_compile) {
+        throw CompileIncompatibleError(
+            "stablehlo.while: nested while-loops are not supported in the "
+            "eager compile-probe path; falling back to uncompiled execution");
     }
 
     std::vector<mlx::core::array> loopVars;
@@ -632,10 +651,11 @@ bool HandleCase(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::ar
     if (!index)
         return false;
 
-    if (ctx.inside_compile) {
+    if (ctx.inside_compile && ctx.allow_while_primitive) {
         // --- Custom primitive approach ---
-        // Create a CasePrimitive that is opaque to mx::compile but executes
-        // the selected branch with compiled body + eval when eval'd.
+        // Instead of throwing CompileIncompatibleError, create a CasePrimitive
+        // that is opaque to mx::compile but executes the selected branch with
+        // compiled body + eval when eval'd.
 
         auto branches = caseOp.getBranches();
         const size_t numBranches = branches.size();
@@ -813,7 +833,7 @@ bool HandleCase(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::ar
                 ExecContext branchCtx;
                 branchCtx.module = module;
                 branchCtx.inside_compile = true;
-
+                branchCtx.allow_while_primitive = true;
                 if (!ExecuteRegion(branchRegion, branchArgs, results, branchCtx, &parentVals))
                     throw std::runtime_error("CasePrimitive: branch " + std::to_string(b) +
                                              " execution failed");
@@ -856,6 +876,14 @@ bool HandleCase(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::ar
         for (size_t i = 0; i < nOutputs; ++i)
             values.emplace(ToKey(op->getResult(i)), std::move(outputArrays[i]));
         return true;
+    }
+
+    // inside_compile == true but allow_while_primitive == false:
+    // Throw to trigger fallback to uncompiled execution (same as WhileLoopPrimitive).
+    if (ctx.inside_compile) {
+        throw CompileIncompatibleError(
+            "stablehlo.case: CasePrimitive requires allow_while_primitive; "
+            "falling back to uncompiled execution");
     }
 
     // --- Eager (non-compile) path ---
