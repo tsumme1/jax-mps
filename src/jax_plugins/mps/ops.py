@@ -1052,5 +1052,5 @@ def patch_jax_functions():
 
             _patched_layer_norm_call._mps_patched = True
             _nnx.LayerNorm.__call__ = _patched_layer_norm_call  # type: ignore[assignment]
-    except ImportError:
+    except Exception:
         pass
