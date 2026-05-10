@@ -204,7 +204,7 @@ def main():
         "-p",
         "no:benchmark",
         "--tb=no",
-        "-q",
+
         f"--timeout={args.timeout}",
         "--continue-on-collection-errors",
     ]
