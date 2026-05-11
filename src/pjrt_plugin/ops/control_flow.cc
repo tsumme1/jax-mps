@@ -386,6 +386,13 @@ bool HandleWhile(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::a
         // --- Custom primitive approach ---
         // Create a WhileLoopPrimitive that is opaque to mx::compile but runs
         // the loop with compiled body + per-step eval when eval'd.
+        //
+        // This path is safe for BOTH the PJRT compile path and the eager
+        // compile-probe path (below). In both cases, the primitive's inputs
+        // are explicit graph edges created via make_arrays(), so mx::compile
+        // correctly recomputes them on replay — they are never frozen as
+        // compile-time constants. The former `allow_while_primitive` guard
+        // was unnecessary given this graph-edge-based design.
 
         std::vector<mlx::core::array> loopVars;
         for (auto operand : op->getOperands()) {
@@ -672,12 +679,14 @@ bool HandleCase(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::ar
         // we build an indexFn that re-computes the index from raw function
         // arguments at runtime.
         //
-        // Strategy: walk the SSA chain from caseOp.getIndex() to find the
-        // function argument it depends on. For the common pattern:
+        // Strategy: inspect the immediate defining op of caseOp.getIndex()
+        // to identify the function argument it depends on. For the common
+        // pattern:
         //   %c = constant 0
         //   %c_0 = constant N-1
         //   %idx = clamp(%c, %argK, %c_0)
-        // we reconstruct the clamp inside indexFn. For other patterns, we
+        // we reconstruct the clamp inside indexFn. For convert(bool→int32)
+        // (lax.cond), we look through one level. For other patterns, we
         // fall back to including the index directly (which only works for
         // trivial cases where the index IS a function argument).
 

@@ -1052,5 +1052,10 @@ def patch_jax_functions():
 
             _patched_layer_norm_call._mps_patched = True
             _nnx.LayerNorm.__call__ = _patched_layer_norm_call  # type: ignore[assignment]
-    except Exception:
+    except (ImportError, DeprecationWarning):
         pass
+    except Exception as exc:
+        import logging
+        logging.getLogger("jax_mps").debug(
+            "Flax LayerNorm patch skipped due to unexpected error: %s", exc
+        )

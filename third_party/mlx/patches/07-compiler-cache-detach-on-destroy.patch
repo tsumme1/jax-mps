@@ -2,7 +2,7 @@ diff --git a/mlx/compile.cpp b/mlx/compile.cpp
 index 6f3d89c..8e013f0 100644
 --- a/mlx/compile.cpp
 +++ b/mlx/compile.cpp
-@@ -372,7 +372,15 @@ class CompilerCache {
+@@ -372,7 +372,16 @@ class CompilerCache {
    }
  
    void clear() {
@@ -16,10 +16,11 @@ index 6f3d89c..8e013f0 100644
 +    // Moving first leaves cache_ empty, so reentrant erases hit an empty
 +    // map and are no-ops while the detached map drains safely.
 +    auto detached = std::move(cache_);
++    (void)detached;
    }
  
    bool empty() {
-@@ -386,6 +394,14 @@ class CompilerCache {
+@@ -386,6 +395,15 @@ class CompilerCache {
      allocator::allocator();
    }
  
@@ -29,6 +30,7 @@ index 6f3d89c..8e013f0 100644
 +    // destructors may re-enter cache_.erase(), hitting UAF on bucket
 +    // pointers to already-freed nodes.
 +    auto detached = std::move(cache_);
++    (void)detached;
 +  }
 +
    friend CompilerCache& compiler_cache();
