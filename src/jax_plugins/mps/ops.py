@@ -1056,6 +1056,7 @@ def patch_jax_functions():
         pass
     except Exception as exc:
         import logging
+
         logging.getLogger("jax_mps").debug(
             "Flax LayerNorm patch skipped due to unexpected error: %s", exc
         )

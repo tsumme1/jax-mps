@@ -290,9 +290,8 @@ public:
     // nOutputs: number of outputs (same for all branches, from MLIR types).
     // nExt: number of external captures threaded as inputs.
     // outShapes/outDtypes: output shapes and dtypes from MLIR result types.
-    CasePrimitive(mlx::core::Stream stream, CompiledFn indexFn,
-                  std::vector<CompiledFn> branches, size_t nOutputs,
-                  size_t nExt, std::vector<mlx::core::Shape> outShapes,
+    CasePrimitive(mlx::core::Stream stream, CompiledFn indexFn, std::vector<CompiledFn> branches,
+                  size_t nOutputs, size_t nExt, std::vector<mlx::core::Shape> outShapes,
                   std::vector<mlx::core::Dtype> outDtypes)
         : Primitive(stream),
           indexFn_(std::move(indexFn)),
@@ -727,12 +726,16 @@ bool HandleCase(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::ar
                 if (indexArgPos != SIZE_MAX) {
                     needsClamp = true;
                     // Extract clamp bounds from the MLIR constants.
-                    if (auto minOp = clampOp.getMin().getDefiningOp<mlir::stablehlo::ConstantOp>()) {
-                        if (auto attr = mlir::dyn_cast<mlir::DenseIntElementsAttr>(minOp.getValue()))
+                    if (auto minOp =
+                            clampOp.getMin().getDefiningOp<mlir::stablehlo::ConstantOp>()) {
+                        if (auto attr =
+                                mlir::dyn_cast<mlir::DenseIntElementsAttr>(minOp.getValue()))
                             clampMin = (*attr.begin()).getSExtValue();
                     }
-                    if (auto maxOp = clampOp.getMax().getDefiningOp<mlir::stablehlo::ConstantOp>()) {
-                        if (auto attr = mlir::dyn_cast<mlir::DenseIntElementsAttr>(maxOp.getValue()))
+                    if (auto maxOp =
+                            clampOp.getMax().getDefiningOp<mlir::stablehlo::ConstantOp>()) {
+                        if (auto attr =
+                                mlir::dyn_cast<mlir::DenseIntElementsAttr>(maxOp.getValue()))
                             clampMax = (*attr.begin()).getSExtValue();
                     }
                 }
@@ -784,18 +787,17 @@ bool HandleCase(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::ar
             compiledIndexFn = mlx::core::compile(
                 [indexArgPos, clampMin, clampMax](
                     const std::vector<mlx::core::array>& inputs) -> std::vector<mlx::core::array> {
-                auto val = mlx::core::astype(inputs[indexArgPos], mlx::core::int32);
-                auto result = mlx::core::clip(val,
-                    mlx::core::array(clampMin, mlx::core::int32),
-                    mlx::core::array(clampMax, mlx::core::int32));
-                return {result};
-            });
+                    auto val = mlx::core::astype(inputs[indexArgPos], mlx::core::int32);
+                    auto result = mlx::core::clip(val, mlx::core::array(clampMin, mlx::core::int32),
+                                                  mlx::core::array(clampMax, mlx::core::int32));
+                    return {result};
+                });
         } else {
             compiledIndexFn = mlx::core::compile(
                 [indexArgPos](
                     const std::vector<mlx::core::array>& inputs) -> std::vector<mlx::core::array> {
-                return {mlx::core::astype(inputs[indexArgPos], mlx::core::int32)};
-            });
+                    return {mlx::core::astype(inputs[indexArgPos], mlx::core::int32)};
+                });
         }
 
         // Build one compiled function per branch.
@@ -807,8 +809,8 @@ bool HandleCase(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::ar
         compiledBranches.reserve(numBranches);
         for (size_t b = 0; b < numBranches; ++b) {
             auto branchFn =
-                [caseOpPtr, b, module, extKeys,
-                 nExt](const std::vector<mlx::core::array>& inputs) -> std::vector<mlx::core::array> {
+                [caseOpPtr, b, module, extKeys, nExt](
+                    const std::vector<mlx::core::array>& inputs) -> std::vector<mlx::core::array> {
                 // inputs = external values
                 ValueMap parentVals;
                 for (size_t i = 0; i < nExt; ++i)
@@ -837,8 +839,7 @@ bool HandleCase(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::ar
         std::vector<mlx::core::Dtype> outDtypes;
         outDtypes.reserve(nOutputs);
         for (size_t i = 0; i < nOutputs; ++i) {
-            auto resultType =
-                mlir::dyn_cast<mlir::RankedTensorType>(op->getResult(i).getType());
+            auto resultType = mlir::dyn_cast<mlir::RankedTensorType>(op->getResult(i).getType());
             if (resultType) {
                 outShapes.push_back(GetShape(resultType));
                 outDtypes.push_back(MlirTypeToMlxDtype(resultType.getElementType()));
@@ -856,9 +857,8 @@ bool HandleCase(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::ar
         // Copy outShapes for the primitive; move original into make_arrays.
         auto primShapes = outShapes;
         auto prim = std::make_shared<CasePrimitive>(cpuStream, std::move(compiledIndexFn),
-                                                     std::move(compiledBranches),
-                                                     nOutputs, nExt, std::move(primShapes),
-                                                     outDtypes);
+                                                    std::move(compiledBranches), nOutputs, nExt,
+                                                    std::move(primShapes), outDtypes);
 
         auto outputArrays =
             mlx::core::array::make_arrays(std::move(outShapes), outDtypes, prim, primInputs);
