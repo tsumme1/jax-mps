@@ -730,13 +730,13 @@ bool HandleCase(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::ar
                             clampOp.getMin().getDefiningOp<mlir::stablehlo::ConstantOp>()) {
                         if (auto attr =
                                 mlir::dyn_cast<mlir::DenseIntElementsAttr>(minOp.getValue()))
-                            clampMin = (*attr.begin()).getSExtValue();
+                            clampMin = static_cast<int>((*attr.begin()).getSExtValue());
                     }
                     if (auto maxOp =
                             clampOp.getMax().getDefiningOp<mlir::stablehlo::ConstantOp>()) {
                         if (auto attr =
                                 mlir::dyn_cast<mlir::DenseIntElementsAttr>(maxOp.getValue()))
-                            clampMax = (*attr.begin()).getSExtValue();
+                            clampMax = static_cast<int>((*attr.begin()).getSExtValue());
                     }
                 }
             }
@@ -844,7 +844,7 @@ bool HandleCase(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::ar
                 outShapes.push_back(GetShape(resultType));
                 outDtypes.push_back(MlirTypeToMlxDtype(resultType.getElementType()));
             } else {
-                outShapes.push_back({});
+                outShapes.emplace_back();
                 outDtypes.push_back(mlx::core::float32);
             }
         }
