@@ -289,17 +289,15 @@ public:
     //   Each takes external values as inputs and returns branch results.
     // nOutputs: number of outputs (same for all branches, from MLIR types).
     // nExt: number of external captures threaded as inputs.
-    // outShapes/outDtypes: output shapes and dtypes from MLIR result types.
+    // outShapes: output shapes from MLIR result types.
     CasePrimitive(mlx::core::Stream stream, CompiledFn indexFn, std::vector<CompiledFn> branches,
-                  size_t nOutputs, size_t nExt, std::vector<mlx::core::Shape> outShapes,
-                  std::vector<mlx::core::Dtype> outDtypes)
+                  size_t nOutputs, size_t nExt, std::vector<mlx::core::Shape> outShapes)
         : Primitive(stream),
           indexFn_(std::move(indexFn)),
           branches_(std::move(branches)),
           nOutputs_(nOutputs),
           nExt_(nExt),
-          outShapes_(std::move(outShapes)),
-          outDtypes_(std::move(outDtypes)) {
+          outShapes_(std::move(outShapes)) {
         if (stream.device.type != mlx::core::Device::cpu) {
             throw std::runtime_error(
                 "CasePrimitive must be on the CPU stream — GPU stream "
@@ -371,7 +369,7 @@ private:
     size_t nOutputs_;
     size_t nExt_;
     std::vector<mlx::core::Shape> outShapes_;
-    std::vector<mlx::core::Dtype> outDtypes_;
+
 };
 
 // Handler for stablehlo.while
@@ -654,7 +652,7 @@ bool HandleCase(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::ar
         for (size_t b = 0; b < numBranches; ++b)
             CollectExternalValues(branches[b], values, extKeys, extArrays, &seen);
 
-        // Add ALL function block arguments as dependencies.
+        // Add ALL parent block arguments as dependencies.
         // mx::compile only re-evaluates arrays that directly trace back to
         // function inputs. Intermediate results (e.g., clamp output) get frozen
         // to their first-call values. By including all block arguments, we
@@ -858,7 +856,7 @@ bool HandleCase(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::ar
         auto primShapes = outShapes;
         auto prim = std::make_shared<CasePrimitive>(cpuStream, std::move(compiledIndexFn),
                                                     std::move(compiledBranches), nOutputs, nExt,
-                                                    std::move(primShapes), outDtypes);
+                                                    std::move(primShapes));
 
         auto outputArrays =
             mlx::core::array::make_arrays(std::move(outShapes), outDtypes, prim, primInputs);
