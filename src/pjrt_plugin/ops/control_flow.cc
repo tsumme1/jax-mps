@@ -369,7 +369,6 @@ private:
     size_t nOutputs_;
     size_t nExt_;
     std::vector<mlx::core::Shape> outShapes_;
-
 };
 
 // Handler for stablehlo.while
