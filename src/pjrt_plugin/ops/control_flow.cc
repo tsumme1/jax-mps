@@ -844,8 +844,8 @@ bool HandleCase(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::ar
                 outShapes.push_back(GetShape(resultType));
                 outDtypes.push_back(MlirTypeToMlxDtype(resultType.getElementType()));
             } else {
-                outShapes.emplace_back();
-                outDtypes.push_back(mlx::core::float32);
+                LOG_ERROR("HandleCase: result %zu is not a RankedTensorType", i);
+                return false;
             }
         }
 
