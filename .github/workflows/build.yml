@@ -8,13 +8,19 @@ on:
     branches: [main]
   workflow_dispatch:
 
+env:
+  # Used in cache keys so caches don't cross runner OSes. NOT usable in
+  # `runs-on:` — the `env` context is not available there (GitHub Actions
+  # limitation). Keep this in sync with the literal `runs-on:` values below.
+  RUNNER_IMAGE: macos-26
+
 jobs:
   # Three parallel dependency builds with independent caches.
   # Each cache key hashes only the relevant script(s), so bumping MLX
   # no longer forces an LLVM rebuild (~1h).
   setup-llvm:
     name: Setup LLVM/StableHLO
-    runs-on: macos-14
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v6
 
@@ -23,7 +29,7 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: ${{ github.workspace }}/.jax-mps-deps/llvm
-          key: deps-llvm-v1-macos14-${{ hashFiles('scripts/setup_deps_common.sh', 'scripts/setup_deps_llvm.sh') }}
+          key: deps-llvm-v1-${{ env.RUNNER_IMAGE }}-${{ hashFiles('scripts/setup_deps_common.sh', 'scripts/setup_deps_llvm.sh') }}
           lookup-only: true
 
       - name: Install build tools
@@ -41,11 +47,11 @@ jobs:
         uses: actions/cache/save@v5
         with:
           path: ${{ github.workspace }}/.jax-mps-deps/llvm
-          key: deps-llvm-v1-macos14-${{ hashFiles('scripts/setup_deps_common.sh', 'scripts/setup_deps_llvm.sh') }}
+          key: deps-llvm-v1-${{ env.RUNNER_IMAGE }}-${{ hashFiles('scripts/setup_deps_common.sh', 'scripts/setup_deps_llvm.sh') }}
 
   setup-protobuf:
     name: Setup Protobuf
-    runs-on: macos-14
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v6
 
@@ -54,7 +60,7 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: ${{ github.workspace }}/.jax-mps-deps/protobuf
-          key: deps-protobuf-v1-macos14-${{ hashFiles('scripts/setup_deps_common.sh', 'scripts/setup_deps_protobuf.sh') }}
+          key: deps-protobuf-v1-${{ env.RUNNER_IMAGE }}-${{ hashFiles('scripts/setup_deps_common.sh', 'scripts/setup_deps_protobuf.sh') }}
           lookup-only: true
 
       - name: Install build tools
@@ -72,11 +78,11 @@ jobs:
         uses: actions/cache/save@v5
         with:
           path: ${{ github.workspace }}/.jax-mps-deps/protobuf
-          key: deps-protobuf-v1-macos14-${{ hashFiles('scripts/setup_deps_common.sh', 'scripts/setup_deps_protobuf.sh') }}
+          key: deps-protobuf-v1-${{ env.RUNNER_IMAGE }}-${{ hashFiles('scripts/setup_deps_common.sh', 'scripts/setup_deps_protobuf.sh') }}
 
   setup-mlx:
     name: Setup MLX
-    runs-on: macos-14
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v6
 
@@ -85,7 +91,7 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: ${{ github.workspace }}/.jax-mps-deps/mlx
-          key: deps-mlx-v1-macos14-${{ hashFiles('scripts/setup_deps_common.sh', 'scripts/setup_deps_mlx.sh', 'third_party/mlx/version.txt', 'third_party/mlx/patches/*') }}
+          key: deps-mlx-v1-${{ env.RUNNER_IMAGE }}-${{ hashFiles('scripts/setup_deps_common.sh', 'scripts/setup_deps_mlx.sh', 'third_party/mlx/version.txt', 'third_party/mlx/patches/*') }}
           lookup-only: true
 
       - name: Install build tools
@@ -103,12 +109,12 @@ jobs:
         uses: actions/cache/save@v5
         with:
           path: ${{ github.workspace }}/.jax-mps-deps/mlx
-          key: deps-mlx-v1-macos14-${{ hashFiles('scripts/setup_deps_common.sh', 'scripts/setup_deps_mlx.sh', 'third_party/mlx/version.txt', 'third_party/mlx/patches/*') }}
+          key: deps-mlx-v1-${{ env.RUNNER_IMAGE }}-${{ hashFiles('scripts/setup_deps_common.sh', 'scripts/setup_deps_mlx.sh', 'third_party/mlx/version.txt', 'third_party/mlx/patches/*') }}
 
   build:
     name: Build wheel
     needs: [setup-llvm, setup-protobuf, setup-mlx]
-    runs-on: macos-14
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v6
 
@@ -121,21 +127,21 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: ${{ github.workspace }}/.jax-mps-deps/llvm
-          key: deps-llvm-v1-macos14-${{ hashFiles('scripts/setup_deps_common.sh', 'scripts/setup_deps_llvm.sh') }}
+          key: deps-llvm-v1-${{ env.RUNNER_IMAGE }}-${{ hashFiles('scripts/setup_deps_common.sh', 'scripts/setup_deps_llvm.sh') }}
           fail-on-cache-miss: true
 
       - name: Restore Protobuf cache
         uses: actions/cache/restore@v5
         with:
           path: ${{ github.workspace }}/.jax-mps-deps/protobuf
-          key: deps-protobuf-v1-macos14-${{ hashFiles('scripts/setup_deps_common.sh', 'scripts/setup_deps_protobuf.sh') }}
+          key: deps-protobuf-v1-${{ env.RUNNER_IMAGE }}-${{ hashFiles('scripts/setup_deps_common.sh', 'scripts/setup_deps_protobuf.sh') }}
           fail-on-cache-miss: true
 
       - name: Restore MLX cache
         uses: actions/cache/restore@v5
         with:
           path: ${{ github.workspace }}/.jax-mps-deps/mlx
-          key: deps-mlx-v1-macos14-${{ hashFiles('scripts/setup_deps_common.sh', 'scripts/setup_deps_mlx.sh', 'third_party/mlx/version.txt', 'third_party/mlx/patches/*') }}
+          key: deps-mlx-v1-${{ env.RUNNER_IMAGE }}-${{ hashFiles('scripts/setup_deps_common.sh', 'scripts/setup_deps_mlx.sh', 'third_party/mlx/version.txt', 'third_party/mlx/patches/*') }}
           fail-on-cache-miss: true
 
       - name: Install dependencies
@@ -155,7 +161,7 @@ jobs:
   lint-cpp:
     name: Lint C++
     needs: [setup-llvm, setup-protobuf, setup-mlx]
-    runs-on: macos-14
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v6
 
@@ -168,21 +174,21 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: ${{ github.workspace }}/.jax-mps-deps/llvm
-          key: deps-llvm-v1-macos14-${{ hashFiles('scripts/setup_deps_common.sh', 'scripts/setup_deps_llvm.sh') }}
+          key: deps-llvm-v1-${{ env.RUNNER_IMAGE }}-${{ hashFiles('scripts/setup_deps_common.sh', 'scripts/setup_deps_llvm.sh') }}
           fail-on-cache-miss: true
 
       - name: Restore Protobuf cache
         uses: actions/cache/restore@v5
         with:
           path: ${{ github.workspace }}/.jax-mps-deps/protobuf
-          key: deps-protobuf-v1-macos14-${{ hashFiles('scripts/setup_deps_common.sh', 'scripts/setup_deps_protobuf.sh') }}
+          key: deps-protobuf-v1-${{ env.RUNNER_IMAGE }}-${{ hashFiles('scripts/setup_deps_common.sh', 'scripts/setup_deps_protobuf.sh') }}
           fail-on-cache-miss: true
 
       - name: Restore MLX cache
         uses: actions/cache/restore@v5
         with:
           path: ${{ github.workspace }}/.jax-mps-deps/mlx
-          key: deps-mlx-v1-macos14-${{ hashFiles('scripts/setup_deps_common.sh', 'scripts/setup_deps_mlx.sh', 'third_party/mlx/version.txt', 'third_party/mlx/patches/*') }}
+          key: deps-mlx-v1-${{ env.RUNNER_IMAGE }}-${{ hashFiles('scripts/setup_deps_common.sh', 'scripts/setup_deps_mlx.sh', 'third_party/mlx/version.txt', 'third_party/mlx/patches/*') }}
           fail-on-cache-miss: true
 
       - name: Install llvm
@@ -206,7 +212,7 @@ jobs:
   lint-python:
     name: Lint Python
     needs: build
-    runs-on: macos-14
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v6
 
@@ -238,7 +244,7 @@ jobs:
   build-dev:
     name: Build dev wheel
     needs: [setup-llvm, setup-protobuf, setup-mlx]
-    runs-on: macos-14
+    runs-on: macos-26
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     steps:
       - uses: actions/checkout@v6
@@ -252,21 +258,21 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: ${{ github.workspace }}/.jax-mps-deps/llvm
-          key: deps-llvm-v1-macos14-${{ hashFiles('scripts/setup_deps_common.sh', 'scripts/setup_deps_llvm.sh') }}
+          key: deps-llvm-v1-${{ env.RUNNER_IMAGE }}-${{ hashFiles('scripts/setup_deps_common.sh', 'scripts/setup_deps_llvm.sh') }}
           fail-on-cache-miss: true
 
       - name: Restore Protobuf cache
         uses: actions/cache/restore@v5
         with:
           path: ${{ github.workspace }}/.jax-mps-deps/protobuf
-          key: deps-protobuf-v1-macos14-${{ hashFiles('scripts/setup_deps_common.sh', 'scripts/setup_deps_protobuf.sh') }}
+          key: deps-protobuf-v1-${{ env.RUNNER_IMAGE }}-${{ hashFiles('scripts/setup_deps_common.sh', 'scripts/setup_deps_protobuf.sh') }}
           fail-on-cache-miss: true
 
       - name: Restore MLX cache
         uses: actions/cache/restore@v5
         with:
           path: ${{ github.workspace }}/.jax-mps-deps/mlx
-          key: deps-mlx-v1-macos14-${{ hashFiles('scripts/setup_deps_common.sh', 'scripts/setup_deps_mlx.sh', 'third_party/mlx/version.txt', 'third_party/mlx/patches/*') }}
+          key: deps-mlx-v1-${{ env.RUNNER_IMAGE }}-${{ hashFiles('scripts/setup_deps_common.sh', 'scripts/setup_deps_mlx.sh', 'third_party/mlx/version.txt', 'third_party/mlx/patches/*') }}
           fail-on-cache-miss: true
 
       - name: Build dev wheel
@@ -288,7 +294,7 @@ jobs:
   test:
     name: Test
     needs: build
-    runs-on: macos-14
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v6
 
